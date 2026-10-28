@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "mc-render"
 version.workspace = true
 edition.workspace = true
@@ -8,4 +8,9 @@ publish.workspace = true
 [dependencies]
 mc-world = { path = "../mc-world" }
 mc-assets = { path = "../mc-assets" }
+wgpu = "30.0.1"
+pollster = "1.0.1"
+glam = "0.34.1"
+anyhow = "1.0.104"
+bytemuck = { version = "1.25.2", features = ["derive"] }
 

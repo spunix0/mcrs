@@ -282,7 +282,7 @@ impl App {
                 .unwrap_or_else(|| "release".into());
             let installed = self.paths.is_installed(&id);
 
-            ui.label(text("MINECRAFT  ·  JAVA EDITION", 12.5, ACCENT));
+            ui.label(text("MINECRAFT  ·  RUST EDITION", 12.5, ACCENT));
             ui.add_space(2.0);
             ui.label(bold(&id, 84.0, TEXT));
             ui.horizontal(|ui| {

@@ -26,7 +26,7 @@ No external dependencies yet; add them per crate as each milestone starts.
 0. Decompile reference (done: `../reference/mc-26.3-client`, Vineflower 1.12.0 in `../tools`)
 1. Launcher: login, download version, launch vanilla
 2. Client joins a real server (headless done: login, config, play, keep-alive, chunks counted, chat; test server in %LOCALAPPDATA%\mcrs-server)
-3. Chunks render with textures (Sodium-style mesher), benchmark vs vanilla 26.3
+3. Chunks render with textures (first version done: block models + atlas, wgpu, fly camera, ~1.7s to first frame; next: Sodium-style mesher, benchmark vs vanilla 26.3)
 4. Walk with correct physics, mouse + Xbox controller
 5. Entities, GUI, sound
 6. One-click singleplayer via local server
@@ -35,3 +35,5 @@ No external dependencies yet; add them per crate as each milestone starts.
 - Everything lives in `C:\Users\nooak\mcrs`: `build` (cargo target, see `.cargo/config.toml`), `data` (launcher installs, game dir), `server` (local test server). The project path is long and hits Windows MAX_PATH.
 - Never write under AppData from the Claude desktop app: it's a packaged app, so AppData writes get redirected into its private storage (`AppData\Local\Packages\Claude_*\LocalCache`) and other programs can't see them.
 - Windows PowerShell 5.1 can't list the deep `reference` folders; use Grep/Glob or `\\?\` paths.
+- The client needs `data\reports\blocks.json` (from the server's `--reports` data generator) to map block state IDs to names. The launcher should generate it on install; for now it's copied by hand.
+- Test server (`C:\Users\nooak\mcrs\server`) runs offline, localhost-only, whitelist off, allow-flight on, peaceful.

@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "mc-assets"
 version.workspace = true
 edition.workspace = true
@@ -6,4 +6,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+anyhow = "1.0.104"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+serde_json = "1.0.154"
+zip = { version = "9.1.3", default-features = false, features = ["deflate"] }
 

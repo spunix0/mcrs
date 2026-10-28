@@ -12,4 +12,6 @@ mc-render = { path = "../mc-render" }
 mc-assets = { path = "../mc-assets" }
 anyhow = "1.0.104"
 md5 = "0.8.1"
+winit = "0.30.13"
+glam = "0.34.1"
 

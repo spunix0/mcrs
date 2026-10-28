@@ -44,6 +44,8 @@ pub mod play {
         pub const CHAT_COMMAND: i32 = 7;
         pub const CHAT: i32 = 9;
         pub const CHUNK_BATCH_RECEIVED: i32 = 11;
+        pub const CLIENT_COMMAND: i32 = 12;
+        pub const CLIENT_TICK_END: i32 = 13;
         pub const CONFIGURATION_ACKNOWLEDGED: i32 = 16;
         pub const KEEP_ALIVE: i32 = 28;
         pub const MOVE_PLAYER_POS_ROT: i32 = 31;
