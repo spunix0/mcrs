@@ -37,5 +37,5 @@ No external dependencies yet; add them per crate as each milestone starts.
 - Never write under AppData from the Claude desktop app: it's a packaged app, so AppData writes get redirected into its private storage (`AppData\Local\Packages\Claude_*\LocalCache`) and other programs can't see them.
 - Windows PowerShell 5.1 can't list the deep `reference` folders; use Grep/Glob or `\\?\` paths.
 - The client needs `data\reports\blocks.json` (from the server's `--reports` data generator) to map block state IDs to names. The launcher should generate it on install; for now it's copied by hand.
-- Test server (`C:\Users\nooak\mcrs\server`) runs offline, localhost-only, whitelist off, allow-flight on, peaceful.
+- Test server (`C:\Users\nooak\mcrs\server`) runs offline, localhost-only, whitelist off, allow-flight on, peaceful. RustPlayer is an operator (`ops.json`) so the client can switch itself to spectator for noclip.
 - 26.x sends light bitmasks as byte arrays (`BitSet.toByteArray`), not long arrays like older versions.

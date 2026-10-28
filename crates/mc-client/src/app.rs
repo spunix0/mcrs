@@ -50,6 +50,7 @@ pub struct App {
     started: Instant,
     models: Arc<BlockModels>,
     vsync: bool,
+    noclip: bool,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     net: Receiver<Event>,
@@ -77,7 +78,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(started: Instant, models: Arc<BlockModels>, net: Receiver<Event>, tx: mc_protocol::Sender, vsync: bool) -> Self {
+    pub fn new(started: Instant, models: Arc<BlockModels>, net: Receiver<Event>, tx: mc_protocol::Sender, vsync: bool, noclip: bool) -> Self {
         let (jobs, job_rx) = channel::<(u64, Area)>();
         let (mesh_tx, meshes) = channel();
         let job_rx = Arc::new(Mutex::new(job_rx));
@@ -97,6 +98,7 @@ impl App {
             started,
             models,
             vsync,
+            noclip,
             window: None,
             renderer: None,
             net,
@@ -171,6 +173,11 @@ impl App {
                 Event::InWorld => {
                     self.in_world = true;
                     self.status = "in world".into();
+                    // Spectators are the only players the server lets fly through blocks.
+                    // Needs operator rights; without them the server just replies with an error message.
+                    if self.noclip {
+                        let _ = session::send_chat(&self.tx, "/gamemode spectator");
+                    }
                 }
                 Event::Chunk(c) => {
                     let key = (c.x, c.z);

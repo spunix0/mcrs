@@ -1,6 +1,7 @@
 ﻿//! Game client: window and input loop (winit, gilrs), prediction and player physics, ties the other crates together.
 //!
-//! `mc-client [--connect 127.0.0.1:25565] [--name Player] [--no-vsync]` opens a window and renders the world.
+//! `mc-client [--connect 127.0.0.1:25565] [--name Player] [--no-vsync] [--no-noclip]` opens a window and renders the world.
+//! It asks to become a spectator on join so the camera can fly through blocks (needs operator rights on the server).
 //! `--headless [--say "hi"] [--for 30] [--greet]` runs without a window; stdin lines are sent as chat.
 
 mod app;
@@ -62,7 +63,9 @@ fn run() -> Result<()> {
 
     let event_loop = winit::event_loop::EventLoop::new()?;
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
-    let mut app = app::App::new(started, models, net_rx, tx, !args.iter().any(|a| a == "--no-vsync"));
+    let vsync = !args.iter().any(|a| a == "--no-vsync");
+    let noclip = !args.iter().any(|a| a == "--no-noclip");
+    let mut app = app::App::new(started, models, net_rx, tx, vsync, noclip);
     event_loop.run_app(&mut app)?;
     Ok(())
 }
