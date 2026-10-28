@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "mc-client"
 version.workspace = true
 edition.workspace = true
@@ -10,4 +10,6 @@ mc-protocol = { path = "../mc-protocol" }
 mc-world = { path = "../mc-world" }
 mc-render = { path = "../mc-render" }
 mc-assets = { path = "../mc-assets" }
+anyhow = "1.0.104"
+md5 = "0.8.1"
 

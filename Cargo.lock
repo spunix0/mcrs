@@ -1931,10 +1931,12 @@ version = "0.1.0"
 name = "mc-client"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "mc-assets",
  "mc-protocol",
  "mc-render",
  "mc-world",
+ "md5",
 ]
 
 [[package]]
@@ -1960,6 +1962,7 @@ version = "0.1.0"
 name = "mc-protocol"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "mc-nbt",
 ]
 

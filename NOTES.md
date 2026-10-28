@@ -1,4 +1,4 @@
-# mcrs: Minecraft Java client in Rust
+﻿# mcrs: Minecraft Java client in Rust
 
 Personal-use project. Goal: a faster, vanilla-compatible client. Not for redistribution (uses the user's own game files).
 
@@ -25,7 +25,7 @@ No external dependencies yet; add them per crate as each milestone starts.
 ## Milestones
 0. Decompile reference (done: `../reference/mc-26.3-client`, Vineflower 1.12.0 in `../tools`)
 1. Launcher: login, download version, launch vanilla
-2. Client joins a real server
+2. Client joins a real server (headless done: login, config, play, keep-alive, chunks counted, chat; test server in %LOCALAPPDATA%\mcrs-server)
 3. Chunks render with textures (Sodium-style mesher), benchmark vs vanilla 26.3
 4. Walk with correct physics, mouse + Xbox controller
 5. Entities, GUI, sound
