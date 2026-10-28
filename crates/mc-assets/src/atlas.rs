@@ -10,6 +10,8 @@ pub struct Atlas {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+    /// Mip levels 1.. (each half the size of the previous), down to 1 pixel per tile.
+    pub mips: Vec<Vec<u8>>,
     rects: HashMap<String, [f32; 4]>,
     alpha: HashMap<String, (bool, bool)>,
 }
@@ -45,6 +47,38 @@ fn load_tile(jar: &mut Jar, name: &str) -> Option<Vec<u8>> {
     Some(px)
 }
 
+/// Box-filters down to 1 pixel per tile. Colors are weighted by alpha so transparent pixels don't darken edges.
+fn mipmaps(base: &[u8], width: usize, height: usize) -> Vec<Vec<u8>> {
+    let mut levels = Vec::new();
+    let (mut w, mut h, mut prev) = (width, height, base.to_vec());
+    let mut tile = TILE;
+    while tile > 1 {
+        let (nw, nh) = (w / 2, h / 2);
+        let mut next = vec![0u8; nw * nh * 4];
+        for y in 0..nh {
+            for x in 0..nw {
+                let (mut rgb, mut a_sum) = ([0u32; 3], 0u32);
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let p = &prev[((y * 2 + dy) * w + x * 2 + dx) * 4..][..4];
+                    let a = p[3] as u32;
+                    for c in 0..3 {
+                        rgb[c] += p[c] as u32 * a;
+                    }
+                    a_sum += a;
+                }
+                let o = &mut next[(y * nw + x) * 4..][..4];
+                for c in 0..3 {
+                    o[c] = if a_sum > 0 { (rgb[c] / a_sum) as u8 } else { 0 };
+                }
+                o[3] = (a_sum / 4) as u8;
+            }
+        }
+        levels.push(next.clone());
+        (w, h, prev, tile) = (nw, nh, next, tile / 2);
+    }
+    levels
+}
+
 impl Atlas {
     pub fn build(jar: &mut Jar, names: &[String]) -> anyhow::Result<Self> {
         let count = names.len() + 1;
@@ -74,7 +108,8 @@ impl Atlas {
             );
             alpha.insert(name, (has_alpha, translucent));
         }
-        Ok(Self { width: width as u32, height: height as u32, rgba, rects, alpha })
+        let mips = mipmaps(&rgba, width, height);
+        Ok(Self { width: width as u32, height: height as u32, rgba, mips, rects, alpha })
     }
 
     pub fn rect(&self, name: &str) -> [f32; 4] {

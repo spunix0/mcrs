@@ -4,7 +4,7 @@
 use anyhow::{Result, bail};
 use mc_protocol::ids::{config, handshake, login, play};
 use mc_protocol::{PROTOCOL_VERSION, Reader, Sender, Writer, text};
-use mc_world::{Chunk, Registries};
+use mc_world::{Chunk, LightUpdate, Registries};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Overworld in 26.3 spans Y -64..320.
@@ -17,6 +17,9 @@ pub enum Event {
     InWorld,
     Chunk(Chunk),
     Forget(i32, i32),
+    /// Block changes as (world position, new state).
+    Blocks(Vec<([i32; 3], u16)>),
+    Light(i32, i32, LightUpdate),
     /// Server moved us: feet position and yaw/pitch.
     Teleport([f64; 3], [f32; 2]),
     Chat(String),
@@ -161,7 +164,32 @@ pub fn run(opts: &Options, tx: Sender, mut rx: mc_protocol::Receiver, mut emit: 
             }
             (State::Play, play::s2c::LEVEL_CHUNK_WITH_LIGHT) => match mc_world::decode_chunk(&body, MIN_SECTION, reg) {
                 Ok(chunk) => emit(Event::Chunk(chunk)),
-                Err(e) => emit(Event::Chat(format!("couldn't decode a chunk: {e}"))),
+                Err(e) => {
+                    if debug {
+                        let _ = std::fs::write("bad-chunk.bin", &body);
+                    }
+                    emit(Event::Chat(format!("couldn't decode a chunk: {e}")))
+                }
+            },
+            (State::Play, play::s2c::BLOCK_UPDATE) => {
+                let pos = mc_world::unpack_block_pos(r.i64()?);
+                emit(Event::Blocks(vec![(pos, r.varint()? as u16)]));
+            }
+            (State::Play, play::s2c::SECTION_BLOCKS_UPDATE) => {
+                let [sx, sy, sz] = mc_world::unpack_section_pos(r.i64()?);
+                let n = r.len()?;
+                let mut changes = Vec::with_capacity(n);
+                for _ in 0..n {
+                    // state << 12 | x << 8 | z << 4 | y
+                    let v = r.varlong()?;
+                    let (lx, lz, ly) = (((v >> 8) & 15) as i32, ((v >> 4) & 15) as i32, (v & 15) as i32);
+                    changes.push(([sx * 16 + lx, sy * 16 + ly, sz * 16 + lz], (v >> 12) as u16));
+                }
+                emit(Event::Blocks(changes));
+            }
+            (State::Play, play::s2c::LIGHT_UPDATE) => match mc_world::decode_light_update(&body) {
+                Ok((x, z, light)) => emit(Event::Light(x, z, light)),
+                Err(e) => emit(Event::Chat(format!("couldn't decode a light update: {e}"))),
             },
             (State::Play, play::s2c::FORGET_LEVEL_CHUNK) => {
                 let packed = r.i64()?;

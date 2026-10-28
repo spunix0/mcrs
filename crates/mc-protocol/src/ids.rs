@@ -53,6 +53,9 @@ pub mod play {
         pub const PONG: i32 = 45;
     }
     pub mod s2c {
+        pub const BLOCK_UPDATE: i32 = 8;
+        pub const LIGHT_UPDATE: i32 = 49;
+        pub const SECTION_BLOCKS_UPDATE: i32 = 86;
         pub const CHUNK_BATCH_FINISHED: i32 = 11;
         pub const CHUNK_BATCH_START: i32 = 12;
         pub const DISCONNECT: i32 = 32;

@@ -23,15 +23,78 @@ impl Section {
     pub fn is_air(&self) -> bool {
         matches!(self, Section::Uniform(0))
     }
+
+    pub fn set(&mut self, x: usize, y: usize, z: usize, state: u16) {
+        if let Section::Uniform(v) = *self {
+            if v == state {
+                return;
+            }
+            *self = Section::Mixed(Box::new([v; SECTION_VOLUME]));
+        }
+        if let Section::Mixed(d) = self {
+            d[(y << 8) | (z << 4) | x] = state;
+        }
+    }
+}
+
+/// One light layer of a 16x16x16 section: 4096 nibbles, same index order as [`Section`].
+pub type Nibbles = Box<[u8; 2048]>;
+
+fn nibble(data: &[u8; 2048], x: usize, y: usize, z: usize) -> u8 {
+    let i = (y << 8) | (z << 4) | x;
+    (data[i >> 1] >> ((i & 1) * 4)) & 15
+}
+
+/// Sky and block light for a column. Light sections run one below and one above the block sections.
+#[derive(Clone, Default)]
+pub struct Light {
+    pub sky: Vec<Option<Nibbles>>,
+    pub block: Vec<Option<Nibbles>>,
+}
+
+/// A light payload from `level_chunk_with_light` or `light_update`.
+pub struct LightUpdate {
+    sky_mask: Vec<u8>,
+    block_mask: Vec<u8>,
+    empty_sky: Vec<u8>,
+    empty_block: Vec<u8>,
+    sky: Vec<Nibbles>,
+    block: Vec<Nibbles>,
+}
+
+/// Bitsets are `BitSet.toByteArray()` since 26.x: little-endian bytes, bit i = byte i/8, bit i%8.
+fn bit(mask: &[u8], i: usize) -> bool {
+    mask.get(i / 8).is_some_and(|b| (b >> (i % 8)) & 1 != 0)
+}
+
+impl Light {
+    fn apply_layer(layer: &mut Vec<Option<Nibbles>>, count: usize, mask: &[u8], empty: &[u8], data: Vec<Nibbles>) {
+        layer.resize_with(count, || None);
+        let mut data = data.into_iter();
+        for i in 0..count {
+            if bit(mask, i) {
+                layer[i] = data.next();
+            } else if bit(empty, i) {
+                layer[i] = Some(Box::new([0; 2048]));
+            }
+        }
+    }
+
+    pub fn apply(&mut self, update: LightUpdate, light_sections: usize) {
+        Self::apply_layer(&mut self.sky, light_sections, &update.sky_mask, &update.empty_sky, update.sky);
+        Self::apply_layer(&mut self.block, light_sections, &update.block_mask, &update.empty_block, update.block);
+    }
 }
 
 /// A chunk column as sent by the server.
+#[derive(Clone)]
 pub struct Chunk {
     pub x: i32,
     pub z: i32,
     /// Section index of `sections[0]` (world Y = min_section * 16).
     pub min_section: i32,
     pub sections: Vec<Section>,
+    pub light: Light,
 }
 
 impl Chunk {
@@ -43,6 +106,47 @@ impl Chunk {
             _ => 0,
         }
     }
+
+    /// Sets a block; returns false if `y` is outside the column.
+    pub fn set(&mut self, x: usize, y: i32, z: usize, state: u16) -> bool {
+        let s = (y >> 4) - self.min_section;
+        match self.sections.get_mut(s as usize) {
+            Some(sec) if s >= 0 => {
+                sec.set(x, (y & 15) as usize, z, state);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `(sky, block)` light at a position in this column. Sections without data count as full sky / no block light.
+    pub fn light(&self, x: usize, y: i32, z: usize) -> (u8, u8) {
+        let s = ((y >> 4) - self.min_section + 1) as usize;
+        let (ly, sky, block) = ((y & 15) as usize, self.light.sky.get(s), self.light.block.get(s));
+        let sky = match sky {
+            Some(Some(d)) => nibble(d, x, ly, z),
+            _ => 15,
+        };
+        let block = match block {
+            Some(Some(d)) => nibble(d, x, ly, z),
+            _ => 0,
+        };
+        (sky, block)
+    }
+
+    pub fn light_sections(&self) -> usize {
+        self.sections.len() + 2
+    }
+}
+
+/// Splits a packed `BlockPos` long (x:26, z:26, y:12 bits).
+pub fn unpack_block_pos(v: i64) -> [i32; 3] {
+    [(v >> 38) as i32, ((v << 52) >> 52) as i32, ((v << 26) >> 38) as i32]
+}
+
+/// Splits a packed `SectionPos` long (x:22, z:22, y:20 bits).
+pub fn unpack_section_pos(v: i64) -> [i32; 3] {
+    [(v >> 42) as i32, ((v << 44) >> 44) as i32, ((v << 22) >> 42) as i32]
 }
 
 fn bad(msg: &str) -> Error {
@@ -89,6 +193,44 @@ impl<'a> Cursor<'a> {
     fn len(&mut self) -> Result<usize> {
         usize::try_from(self.varint()?).map_err(|_| bad("negative length"))
     }
+    fn skip_nbt(&mut self) -> Result<()> {
+        let mut s = self.0;
+        mc_nbt::read_network(&mut s)?;
+        self.0 = s;
+        Ok(())
+    }
+    fn byte_array(&mut self) -> Result<Vec<u8>> {
+        let n = self.len()?;
+        Ok(self.take(n)?.to_vec())
+    }
+    fn nibble_arrays(&mut self) -> Result<Vec<Nibbles>> {
+        let n = self.len()?;
+        (0..n)
+            .map(|_| {
+                let len = self.len()?;
+                let bytes: [u8; 2048] = self.take(len)?.try_into().map_err(|_| bad("light array is not 2048 bytes"))?;
+                Ok(Box::new(bytes))
+            })
+            .collect()
+    }
+    fn light(&mut self) -> Result<LightUpdate> {
+        Ok(LightUpdate {
+            sky_mask: self.byte_array()?,
+            block_mask: self.byte_array()?,
+            empty_sky: self.byte_array()?,
+            empty_block: self.byte_array()?,
+            sky: self.nibble_arrays()?,
+            block: self.nibble_arrays()?,
+        })
+    }
+}
+
+/// Decodes the body of `light_update`: chunk x, z and the light payload.
+pub fn decode_light_update(body: &[u8]) -> Result<(i32, i32, LightUpdate)> {
+    let mut c = Cursor(body);
+    let x = c.varint()?;
+    let z = c.varint()?;
+    Ok((x, z, c.light()?))
 }
 
 enum Palette {
@@ -169,7 +311,17 @@ pub fn decode_chunk(body: &[u8], min_section: i32, reg: Registries) -> Result<Ch
             Section::Mixed(arr)
         });
     }
-    Ok(Chunk { x, z, min_section, sections })
+    // Block entities: packed xz, y, type id, optional NBT. Not used yet, but light data follows them.
+    for _ in 0..c.len()? {
+        c.u8()?;
+        c.i16()?;
+        c.varint()?;
+        c.skip_nbt()?;
+    }
+    let mut chunk = Chunk { x, z, min_section, sections, light: Light::default() };
+    let light_sections = chunk.light_sections();
+    chunk.light.apply(c.light()?, light_sections);
+    Ok(chunk)
 }
 
 #[cfg(test)]
@@ -218,14 +370,40 @@ mod tests {
         varint(&mut body, 0); // no heightmaps
         varint(&mut body, sec.len() as i32);
         body.extend_from_slice(&sec);
-        varint(&mut body, 0); // block entities (ignored)
+        varint(&mut body, 0); // no block entities
+        // Light: sky mask has light section 1 (= block section 0); block light all empty except nothing sent.
+        varint(&mut body, 1); // sky mask: 1 byte
+        body.push(0b10);
+        varint(&mut body, 0); // block mask
+        varint(&mut body, 0); // empty sky
+        varint(&mut body, 0); // empty block
+        varint(&mut body, 1); // one sky array
+        varint(&mut body, 2048);
+        let mut sky = [0u8; 2048];
+        sky[0] = 0x07; // (0,0,0) = 7, (1,0,0) = 0
+        body.extend_from_slice(&sky);
+        varint(&mut body, 0); // no block arrays
 
-        let chunk = decode_chunk(&body, -4, Registries { block_states: 35723, biomes: 65 }).unwrap();
+        let mut chunk = decode_chunk(&body, -4, Registries { block_states: 35723, biomes: 65 }).unwrap();
         assert_eq!((chunk.x, chunk.z, chunk.sections.len()), (3, -2, 2));
         assert_eq!(chunk.get(5, -64, 5), 1);
         assert_eq!(chunk.get(1, -48, 0), 9);
         assert_eq!(chunk.get(0, -48, 0), 0);
         assert_eq!(chunk.get(0, 500, 0), 0);
+        assert_eq!(chunk.light(0, -64, 0), (7, 0));
+        assert_eq!(chunk.light(1, -64, 0), (0, 0));
+        assert_eq!(chunk.light(0, -48, 0), (15, 0)); // no data -> open sky
+        assert!(chunk.set(2, -64, 2, 5));
+        assert_eq!((chunk.get(2, -64, 2), chunk.get(3, -64, 2)), (5, 1));
+    }
+
+    #[test]
+    fn unpacks_positions() {
+        // BlockPos.asLong(-5, 70, 12) and SectionPos.asLong(-2, 4, 3)
+        let b = ((-5i64 & 0x3ff_ffff) << 38) | (70 & 0xfff) | ((12 & 0x3ff_ffff) << 12);
+        assert_eq!(unpack_block_pos(b), [-5, 70, 12]);
+        let s = ((-2i64 & 0x3f_ffff) << 42) | (4 & 0xf_ffff) | ((3 & 0x3f_ffff) << 20);
+        assert_eq!(unpack_section_pos(s), [-2, 4, 3]);
     }
 
     #[test]

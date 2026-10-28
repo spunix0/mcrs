@@ -3,9 +3,9 @@
 use crate::session::{self, Event};
 use glam::{Mat4, Vec3};
 use mc_assets::BlockModels;
-use mc_render::{ChunkMesh, Renderer};
+use mc_render::{Area, ChunkMesh, Renderer};
 use mc_world::Chunk;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -40,9 +40,13 @@ pub struct App {
     renderer: Option<Renderer>,
     net: Receiver<Event>,
     tx: mc_protocol::Sender,
-    jobs: Sender<Arc<Chunk>>,
-    meshes: Receiver<ChunkMesh>,
-    loaded: HashSet<(i32, i32)>,
+    jobs: Sender<(u64, Area)>,
+    meshes: Receiver<(u64, ChunkMesh)>,
+    world: HashMap<(i32, i32), Arc<Chunk>>,
+    /// Bumped on every change; a mesh is only uploaded if it was built from the latest version.
+    versions: HashMap<(i32, i32), u64>,
+    dirty: HashSet<(i32, i32)>,
+    next_version: u64,
     cam: Camera,
     keys: HashSet<KeyCode>,
     grabbed: bool,
@@ -54,13 +58,11 @@ pub struct App {
     first_frame: bool,
     first_chunk: bool,
     status: String,
-    received: u32,
-    meshed: u32,
 }
 
 impl App {
     pub fn new(started: Instant, models: Arc<BlockModels>, net: Receiver<Event>, tx: mc_protocol::Sender, vsync: bool) -> Self {
-        let (jobs, job_rx) = channel::<Arc<Chunk>>();
+        let (jobs, job_rx) = channel::<(u64, Area)>();
         let (mesh_tx, meshes) = channel();
         let job_rx = Arc::new(Mutex::new(job_rx));
         let workers = std::thread::available_parallelism().map_or(4, |n| n.get().saturating_sub(2).max(2));
@@ -68,8 +70,8 @@ impl App {
             let (job_rx, mesh_tx, models) = (job_rx.clone(), mesh_tx.clone(), models.clone());
             std::thread::spawn(move || {
                 loop {
-                    let Ok(chunk) = job_rx.lock().unwrap().recv() else { return };
-                    if mesh_tx.send(mc_render::mesh_chunk(&chunk, &models)).is_err() {
+                    let Ok((version, area)) = job_rx.lock().unwrap().recv() else { return };
+                    if mesh_tx.send((version, mc_render::mesh_chunk(&area, &models))).is_err() {
                         return;
                     }
                 }
@@ -85,7 +87,10 @@ impl App {
             tx,
             jobs,
             meshes,
-            loaded: HashSet::new(),
+            world: HashMap::new(),
+            versions: HashMap::new(),
+            dirty: HashSet::new(),
+            next_version: 0,
             cam: Camera { eye: [0.0, 80.0, 0.0], yaw: 0.0, pitch: 20.0 },
             keys: HashSet::new(),
             grabbed: false,
@@ -97,8 +102,6 @@ impl App {
             first_frame: false,
             first_chunk: false,
             status: "connecting".into(),
-            received: 0,
-            meshed: 0,
         }
     }
 
@@ -115,6 +118,32 @@ impl App {
         }
     }
 
+    fn mark_around(&mut self, x: i32, z: i32) {
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                self.dirty.insert((x + dx, z + dz));
+            }
+        }
+    }
+
+    /// Sends every dirty, loaded chunk to the meshers along with its neighbors.
+    fn dispatch(&mut self) {
+        for key in std::mem::take(&mut self.dirty) {
+            let Some(center) = self.world.get(&key).cloned() else { continue };
+            let mut around: [Option<Arc<Chunk>>; 9] = Default::default();
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    if dx != 0 || dz != 0 {
+                        around[((dz + 1) * 3 + (dx + 1)) as usize] = self.world.get(&(key.0 + dx, key.1 + dz)).cloned();
+                    }
+                }
+            }
+            self.next_version += 1;
+            self.versions.insert(key, self.next_version);
+            let _ = self.jobs.send((self.next_version, Area { center, around }));
+        }
+    }
+
     fn drain(&mut self) {
         while let Ok(ev) = self.net.try_recv() {
             match ev {
@@ -124,14 +153,40 @@ impl App {
                     self.status = "in world".into();
                 }
                 Event::Chunk(c) => {
-                    self.received += 1;
-                    self.loaded.insert((c.x, c.z));
-                    let _ = self.jobs.send(Arc::new(c));
+                    let key = (c.x, c.z);
+                    self.world.insert(key, Arc::new(c));
+                    // Neighbors can now cull their border faces and smooth their border light.
+                    self.mark_around(key.0, key.1);
                 }
                 Event::Forget(x, z) => {
-                    self.loaded.remove(&(x, z));
+                    self.world.remove(&(x, z));
+                    self.versions.remove(&(x, z));
                     if let Some(r) = &mut self.renderer {
                         r.remove(x, z);
+                    }
+                }
+                Event::Blocks(changes) => {
+                    for ([x, y, z], state) in changes {
+                        let (cx, cz) = (x.div_euclid(16), z.div_euclid(16));
+                        let Some(chunk) = self.world.get_mut(&(cx, cz)) else { continue };
+                        let (lx, lz) = (x.rem_euclid(16), z.rem_euclid(16));
+                        Arc::make_mut(chunk).set(lx as usize, y, lz as usize, state);
+                        // A block affects meshes of every chunk whose 1-block border it sits in.
+                        let xs = [-1, 0, 1].into_iter().filter(|d| *d == 0 || (*d == -1 && lx == 0) || (*d == 1 && lx == 15));
+                        for dx in xs {
+                            for dz in [-1, 0, 1] {
+                                if dz == 0 || (dz == -1 && lz == 0) || (dz == 1 && lz == 15) {
+                                    self.dirty.insert((cx + dx, cz + dz));
+                                }
+                            }
+                        }
+                    }
+                }
+                Event::Light(x, z, light) => {
+                    if let Some(chunk) = self.world.get_mut(&(x, z)) {
+                        let sections = chunk.light_sections();
+                        Arc::make_mut(chunk).light.apply(light, sections);
+                        self.mark_around(x, z);
                     }
                 }
                 Event::Teleport(feet, rot) => {
@@ -143,10 +198,10 @@ impl App {
                 Event::Health(_) => {}
             }
         }
+        self.dispatch();
         if let Some(r) = &mut self.renderer {
-            while let Ok(mesh) = self.meshes.try_recv() {
-                self.meshed += 1;
-                if self.loaded.contains(&(mesh.x, mesh.z)) {
+            while let Ok((version, mesh)) = self.meshes.try_recv() {
+                if self.versions.get(&(mesh.x, mesh.z)) == Some(&version) {
                     r.upload(&mesh);
                     if !self.first_chunk {
                         self.first_chunk = true;

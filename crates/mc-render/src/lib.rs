@@ -2,7 +2,7 @@
 
 mod mesh;
 
-pub use mesh::{ChunkMesh, Vertex, mesh_chunk};
+pub use mesh::{Area, ChunkMesh, Vertex, mesh_chunk};
 
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
@@ -119,12 +119,17 @@ impl Renderer {
         config.desired_maximum_frame_latency = 2;
         surface.configure(&device, &config);
 
+        // Base level followed by every mip level, as create_texture_with_data expects for one layer.
+        let mut texels = atlas.rgba.clone();
+        for level in &atlas.mips {
+            texels.extend_from_slice(level);
+        }
         let texture = device.create_texture_with_data(
             &queue,
             &wgpu::TextureDescriptor {
                 label: Some("block atlas"),
                 size: wgpu::Extent3d { width: atlas.width, height: atlas.height, depth_or_array_layers: 1 },
-                mip_level_count: 1,
+                mip_level_count: 1 + atlas.mips.len() as u32,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8UnormSrgb,
@@ -132,11 +137,12 @@ impl Renderer {
                 view_formats: &[],
             },
             wgpu::util::TextureDataOrder::LayerMajor,
-            &atlas.rgba,
+            &texels,
         );
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
