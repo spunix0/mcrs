@@ -22,6 +22,16 @@ const STICK_DEADZONE: f32 = 0.15;
 const PAD_LOOK_SPEED: f32 = 220.0;
 const VIEW_DISTANCE_CHUNKS: f32 = 10.0;
 
+/// Gamepad state for one frame. A rises, clicking the right stick lowers, clicking the left stick sprints.
+#[derive(Default)]
+struct Pad {
+    left: [f32; 2],
+    right: [f32; 2],
+    sprint: bool,
+    rise: bool,
+    lower: bool,
+}
+
 struct Camera {
     eye: [f64; 3],
     yaw: f32,
@@ -222,9 +232,9 @@ impl App {
         }
     }
 
-    /// First connected gamepad: (left stick, right stick, sprint held). All zero without one.
-    fn pad(&mut self) -> ([f32; 2], [f32; 2], bool) {
-        let Some(g) = &mut self.gilrs else { return ([0.0; 2], [0.0; 2], false) };
+    /// First connected gamepad's sticks and buttons; all neutral without one.
+    fn pad(&mut self) -> Pad {
+        let Some(g) = &mut self.gilrs else { return Pad::default() };
         while let Some(ev) = g.next_event() {
             match ev.event {
                 gilrs::EventType::Connected => println!("controller connected: {}", g.gamepad(ev.id).name()),
@@ -232,7 +242,7 @@ impl App {
                 _ => {}
             }
         }
-        let Some((_, pad)) = g.gamepads().find(|(_, p)| p.is_connected()) else { return ([0.0; 2], [0.0; 2], false) };
+        let Some((_, pad)) = g.gamepads().find(|(_, p)| p.is_connected()) else { return Pad::default() };
         let stick = |x: Axis, y: Axis| {
             let v = [pad.value(x), pad.value(y)];
             let len = (v[0] * v[0] + v[1] * v[1]).sqrt();
@@ -243,12 +253,17 @@ impl App {
             let scaled = ((len - STICK_DEADZONE) / (1.0 - STICK_DEADZONE)).min(1.0);
             [v[0] / len * scaled, v[1] / len * scaled]
         };
-        let sprint = pad.is_pressed(Button::LeftThumb);
-        (stick(Axis::LeftStickX, Axis::LeftStickY), stick(Axis::RightStickX, Axis::RightStickY), sprint)
+        Pad {
+            left: stick(Axis::LeftStickX, Axis::LeftStickY),
+            right: stick(Axis::RightStickX, Axis::RightStickY),
+            sprint: pad.is_pressed(Button::LeftThumb),
+            rise: pad.is_pressed(Button::South),
+            lower: pad.is_pressed(Button::RightThumb),
+        }
     }
 
     fn update(&mut self, dt: f32) {
-        let (left, right_stick, pad_sprint) = self.pad();
+        let Pad { left, right: right_stick, sprint: pad_sprint, rise, lower } = self.pad();
         // Squared response gives fine control near the center and full speed at the edge.
         let curve = |v: f32| v * v.abs();
         self.cam.yaw += curve(right_stick[0]) * PAD_LOOK_SPEED * dt;
@@ -266,8 +281,8 @@ impl App {
         if held(KeyCode::KeyS) { add(forward, -1.0) }
         if held(KeyCode::KeyD) { add(right, 1.0) }
         if held(KeyCode::KeyA) { add(right, -1.0) }
-        if held(KeyCode::Space) { add([0.0, 1.0, 0.0], 1.0) }
-        if held(KeyCode::ShiftLeft) { add([0.0, -1.0, 0.0], 1.0) }
+        if held(KeyCode::Space) || rise { add([0.0, 1.0, 0.0], 1.0) }
+        if held(KeyCode::ShiftLeft) || lower { add([0.0, -1.0, 0.0], 1.0) }
         add(forward, left[1] as f64);
         add(right, left[0] as f64);
         // Keys give full speed, the stick gives up to full speed; never faster than either.
