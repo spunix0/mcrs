@@ -1,6 +1,7 @@
 ﻿//! Native launcher: version manifest, downloads, Java runtime, offline accounts, game launch.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod cli;
 mod install;
 mod launch;
 mod meta;
@@ -11,6 +12,10 @@ mod ui;
 use eframe::egui;
 
 fn main() -> eframe::Result {
+    let args: Vec<String> = std::env::args().collect();
+    if cli::run(&args) {
+        return Ok(());
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("mcrs")
