@@ -20,7 +20,6 @@ const EYE_HEIGHT: f64 = 1.62;
 const STICK_DEADZONE: f32 = 0.15;
 /// Degrees per second at full right-stick deflection.
 const PAD_LOOK_SPEED: f32 = 220.0;
-const VIEW_DISTANCE_CHUNKS: f32 = 10.0;
 
 /// Gamepad state for one frame. A rises, clicking the right stick lowers, clicking the left stick sprints.
 #[derive(Default)]
@@ -51,6 +50,7 @@ pub struct App {
     models: Arc<BlockModels>,
     vsync: bool,
     noclip: bool,
+    view_distance: u8,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     net: Receiver<Event>,
@@ -78,7 +78,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(started: Instant, models: Arc<BlockModels>, net: Receiver<Event>, tx: mc_protocol::Sender, vsync: bool, noclip: bool) -> Self {
+    pub fn new(started: Instant, models: Arc<BlockModels>, net: Receiver<Event>, tx: mc_protocol::Sender, vsync: bool, noclip: bool, view_distance: u8) -> Self {
         let (jobs, job_rx) = channel::<(u64, Area)>();
         let (mesh_tx, meshes) = channel();
         let job_rx = Arc::new(Mutex::new(job_rx));
@@ -99,6 +99,7 @@ impl App {
             models,
             vsync,
             noclip,
+            view_distance,
             window: None,
             renderer: None,
             net,
@@ -316,9 +317,10 @@ impl App {
         let Some(r) = &mut self.renderer else { return };
         let eye = Vec3::new(self.cam.eye[0] as f32, self.cam.eye[1] as f32, self.cam.eye[2] as f32);
         let view = glam::camera::rh::view::look_to_mat4(eye, self.cam.look(), Vec3::Y);
-        // DirectX convention = wgpu's: Y up in clip space, depth 0..1.
-        let proj: Mat4 = glam::camera::rh::proj::directx::perspective(70f32.to_radians(), r.aspect(), 0.05, 1000.0);
-        let stats = r.render(proj * view, eye, VIEW_DISTANCE_CHUNKS * 16.0);
+        let fog_end = self.view_distance as f32 * 16.0;
+        // DirectX convention = wgpu's: Y up in clip space, depth 0..1. Far plane covers the fog distance plus world height.
+        let proj: Mat4 = glam::camera::rh::proj::directx::perspective(70f32.to_radians(), r.aspect(), 0.05, fog_end * 1.5 + 400.0);
+        let stats = r.render(proj * view, eye, fog_end);
         if !self.first_frame {
             self.first_frame = true;
             println!("first frame after {:?} ({})", self.started.elapsed(), r.adapter_name);
@@ -331,8 +333,12 @@ impl App {
             if let Some(w) = &self.window {
                 let [x, y, z] = self.cam.eye;
                 w.set_title(&format!(
-                    "mcrs · Rust Edition  |  {fps:.0} fps  |  {}/{} chunks  |  {x:.0} {y:.0} {z:.0}  |  {}",
-                    stats.drawn, stats.loaded, self.status
+                    "mcrs · Rust Edition  |  {fps:.0} fps  |  {}/{} chunks  |  {:.1}M tris  |  {} MB GPU  |  {x:.0} {y:.0} {z:.0}  |  {}",
+                    stats.drawn,
+                    stats.loaded,
+                    stats.triangles as f64 / 1e6,
+                    stats.gpu_bytes / 1_048_576,
+                    self.status
                 ));
             }
         }

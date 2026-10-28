@@ -74,6 +74,8 @@ pub struct Options<'a> {
     pub block_states: Option<usize>,
     /// Someone else (the render loop) sends movement every tick.
     pub drives_movement: bool,
+    /// Chunk radius to ask the server for (it caps this at its own view-distance).
+    pub view_distance: u8,
 }
 
 /// Runs until the server disconnects us; returns the disconnect reason.
@@ -108,6 +110,18 @@ pub fn run(opts: &Options, tx: Sender, mut rx: mc_protocol::Receiver, mut emit: 
                 emit(Event::LoggedIn(r.string()?));
                 tx.send(login::c2s::LOGIN_ACKNOWLEDGED, &[])?;
                 state = State::Config;
+                // ClientInformation: the server sends min(its view-distance, ours) chunks; the default is only 2.
+                let mut w = Writer::new();
+                w.string("en_us")
+                    .u8(opts.view_distance)
+                    .varint(0) // chat: full
+                    .bool(true) // chat colors
+                    .u8(0x7f) // all skin layers
+                    .varint(1) // main hand: right
+                    .bool(false) // text filtering
+                    .bool(true) // show in server list
+                    .varint(0); // particles: all
+                tx.send(config::c2s::CLIENT_INFORMATION, &w.buf)?;
             }
 
             (State::Config, config::s2c::SELECT_KNOWN_PACKS) => {
@@ -196,7 +210,8 @@ pub fn run(opts: &Options, tx: Sender, mut rx: mc_protocol::Receiver, mut emit: 
                 emit(Event::Forget(packed as i32, (packed >> 32) as i32));
             }
             (State::Play, play::s2c::CHUNK_BATCH_FINISHED) => {
-                tx.send(play::c2s::CHUNK_BATCH_RECEIVED, &Writer::new().f32(25.0).buf)?;
+                // Chunks per tick we can take; meshing runs on worker threads, so ask for plenty.
+                tx.send(play::c2s::CHUNK_BATCH_RECEIVED, &Writer::new().f32(64.0).buf)?;
             }
             (State::Play, play::s2c::GAME_EVENT) => {
                 if r.u8()? == 13 && !loaded {

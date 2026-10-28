@@ -28,6 +28,18 @@ struct GpuMesh {
     count: u32,
 }
 
+impl GpuMesh {
+    fn bytes(&self) -> u64 {
+        self.vertices.size() + self.indices.size()
+    }
+}
+
+impl GpuChunk {
+    fn bytes(&self) -> u64 {
+        self.opaque.as_ref().map_or(0, GpuMesh::bytes) + self.translucent.as_ref().map_or(0, GpuMesh::bytes)
+    }
+}
+
 struct GpuChunk {
     opaque: Option<GpuMesh>,
     translucent: Option<GpuMesh>,
@@ -38,6 +50,9 @@ struct GpuChunk {
 pub struct FrameStats {
     pub drawn: usize,
     pub loaded: usize,
+    pub triangles: u64,
+    /// Vertex + index buffer bytes for all loaded chunks.
+    pub gpu_bytes: u64,
 }
 
 pub struct Renderer {
@@ -51,6 +66,7 @@ pub struct Renderer {
     uniforms: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     chunks: HashMap<(i32, i32), GpuChunk>,
+    gpu_bytes: u64,
     pub adapter_name: String,
 }
 
@@ -234,7 +250,7 @@ impl Renderer {
         let translucent = make("fs_translucent", Some(wgpu::BlendState::ALPHA_BLENDING), false, None);
         let depth = depth_view(&device, config.width, config.height);
 
-        Ok(Self { surface, device, queue, config, depth, opaque, translucent, uniforms, bind_group, chunks: HashMap::new(), adapter_name })
+        Ok(Self { surface, device, queue, config, depth, opaque, translucent, uniforms, bind_group, chunks: HashMap::new(), gpu_bytes: 0, adapter_name })
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -258,15 +274,20 @@ impl Renderer {
             min: Vec3::new(mesh.x as f32 * 16.0, mesh.min_y, mesh.z as f32 * 16.0),
             max: Vec3::new(mesh.x as f32 * 16.0 + 16.0, mesh.max_y, mesh.z as f32 * 16.0 + 16.0),
         };
-        self.chunks.insert((mesh.x, mesh.z), gpu);
+        self.gpu_bytes += gpu.bytes();
+        if let Some(old) = self.chunks.insert((mesh.x, mesh.z), gpu) {
+            self.gpu_bytes -= old.bytes();
+        }
     }
 
     pub fn remove(&mut self, x: i32, z: i32) {
-        self.chunks.remove(&(x, z));
+        if let Some(old) = self.chunks.remove(&(x, z)) {
+            self.gpu_bytes -= old.bytes();
+        }
     }
 
     pub fn render(&mut self, view_proj: Mat4, camera: Vec3, fog_end: f32) -> FrameStats {
-        let mut stats = FrameStats { drawn: 0, loaded: self.chunks.len() };
+        let mut stats = FrameStats { drawn: 0, loaded: self.chunks.len(), triangles: 0, gpu_bytes: self.gpu_bytes };
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
@@ -290,6 +311,10 @@ impl Renderer {
             .map(|c| (c, ((c.min + c.max) * 0.5).distance_squared(camera)))
             .collect();
         stats.drawn = visible_chunks.len();
+        stats.triangles = visible_chunks
+            .iter()
+            .map(|(c, _)| (c.opaque.as_ref().map_or(0, |m| m.count) + c.translucent.as_ref().map_or(0, |m| m.count)) as u64 / 3)
+            .sum();
         // Near-to-far for opaque (early depth rejects), far-to-near for translucent blending.
         visible_chunks.sort_by(|a, b| a.1.total_cmp(&b.1));
 

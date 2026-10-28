@@ -21,6 +21,7 @@ pub mod login {
 
 pub mod config {
     pub mod c2s {
+        pub const CLIENT_INFORMATION: i32 = 0;
         pub const FINISH_CONFIGURATION: i32 = 3;
         pub const KEEP_ALIVE: i32 = 4;
         pub const PONG: i32 = 5;

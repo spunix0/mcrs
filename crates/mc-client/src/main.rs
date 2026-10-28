@@ -1,6 +1,6 @@
 ﻿//! Game client: window and input loop (winit, gilrs), prediction and player physics, ties the other crates together.
 //!
-//! `mc-client [--connect 127.0.0.1:25565] [--name Player] [--no-vsync] [--no-noclip]` opens a window and renders the world.
+//! `mc-client [--connect 127.0.0.1:25565] [--name Player] [--view-distance 32] [--no-vsync] [--no-noclip]` opens a window and renders the world.
 //! It asks to become a spectator on join so the camera can fly through blocks (needs operator rights on the server).
 //! `--headless [--say "hi"] [--for 30] [--greet]` runs without a window; stdin lines are sent as chat.
 
@@ -47,11 +47,12 @@ fn run() -> Result<()> {
     let models = Arc::new(assets.join().expect("asset thread panicked").context("loading block models")?);
     println!("assets ready after {:?} ({} block states)", started.elapsed(), models.states.len());
 
+    let view_distance: u8 = arg(&args, "--view-distance").and_then(|s| s.parse().ok()).unwrap_or(32).clamp(2, 64);
     let (net_tx, net_rx) = std::sync::mpsc::channel();
     {
         let (tx, block_states) = (tx.clone(), models.states.len());
         std::thread::spawn(move || {
-            let opts = Options { addr: &addr, name: &name, greet, block_states: Some(block_states), drives_movement: true };
+            let opts = Options { addr: &addr, name: &name, greet, block_states: Some(block_states), drives_movement: true, view_distance };
             match session::run(&opts, tx, rx, |e| {
                 let _ = net_tx.send(e);
             }) {
@@ -65,7 +66,7 @@ fn run() -> Result<()> {
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     let vsync = !args.iter().any(|a| a == "--no-vsync");
     let noclip = !args.iter().any(|a| a == "--no-noclip");
-    let mut app = app::App::new(started, models, net_rx, tx, vsync, noclip);
+    let mut app = app::App::new(started, models, net_rx, tx, vsync, noclip, view_distance);
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -104,7 +105,7 @@ fn headless(args: &[String], addr: &str, name: &str, greet: bool) -> Result<()> 
         });
     }
 
-    let opts = Options { addr, name, greet, block_states: None, drives_movement: false };
+    let opts = Options { addr, name, greet, block_states: None, drives_movement: false, view_distance: 2 };
     let reason = session::run(&opts, tx, rx, |e| match e {
         Event::LoggedIn(n) => println!("logged in as {n}"),
         Event::InWorld => {
