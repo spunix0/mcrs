@@ -1,0 +1,10 @@
+﻿[package]
+name = "mc-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mc-nbt = { path = "../mc-nbt" }
+

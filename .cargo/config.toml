@@ -1,0 +1,3 @@
+﻿# Keep build output on a short path: the project folder path is long and MSVC/Windows tools hit MAX_PATH.
+[build]
+target-dir = "C:/Users/nooak/AppData/Local/mcrs-target"
