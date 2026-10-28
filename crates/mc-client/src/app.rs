@@ -1,6 +1,7 @@
 //! The window: fly camera, chunk meshing on worker threads, rendering, and movement packets back to the server.
 
 use crate::session::{self, Event};
+use gilrs::{Axis, Button, Gilrs};
 use glam::{Mat4, Vec3};
 use mc_assets::BlockModels;
 use mc_render::{Area, ChunkMesh, Renderer};
@@ -16,6 +17,9 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
 const EYE_HEIGHT: f64 = 1.62;
+const STICK_DEADZONE: f32 = 0.15;
+/// Degrees per second at full right-stick deflection.
+const PAD_LOOK_SPEED: f32 = 220.0;
 const VIEW_DISTANCE_CHUNKS: f32 = 10.0;
 
 struct Camera {
@@ -49,6 +53,8 @@ pub struct App {
     next_version: u64,
     cam: Camera,
     keys: HashSet<KeyCode>,
+    /// `None` if the gamepad backend couldn't start; the keyboard still works.
+    gilrs: Option<Gilrs>,
     grabbed: bool,
     in_world: bool,
     last_send: Instant,
@@ -93,6 +99,10 @@ impl App {
             next_version: 0,
             cam: Camera { eye: [0.0, 80.0, 0.0], yaw: 0.0, pitch: 20.0 },
             keys: HashSet::new(),
+            gilrs: Gilrs::new()
+                .map_err(|e| eprintln!("gamepad support unavailable: {e}"))
+                .ok()
+                .inspect(|g| g.gamepads().for_each(|(_, p)| println!("controller found: {}", p.name()))),
             grabbed: false,
             in_world: false,
             last_send: Instant::now(),
@@ -212,9 +222,41 @@ impl App {
         }
     }
 
+    /// First connected gamepad: (left stick, right stick, sprint held). All zero without one.
+    fn pad(&mut self) -> ([f32; 2], [f32; 2], bool) {
+        let Some(g) = &mut self.gilrs else { return ([0.0; 2], [0.0; 2], false) };
+        while let Some(ev) = g.next_event() {
+            match ev.event {
+                gilrs::EventType::Connected => println!("controller connected: {}", g.gamepad(ev.id).name()),
+                gilrs::EventType::Disconnected => println!("controller disconnected"),
+                _ => {}
+            }
+        }
+        let Some((_, pad)) = g.gamepads().find(|(_, p)| p.is_connected()) else { return ([0.0; 2], [0.0; 2], false) };
+        let stick = |x: Axis, y: Axis| {
+            let v = [pad.value(x), pad.value(y)];
+            let len = (v[0] * v[0] + v[1] * v[1]).sqrt();
+            if len < STICK_DEADZONE {
+                return [0.0; 2];
+            }
+            // Rescale so movement starts from zero at the deadzone edge.
+            let scaled = ((len - STICK_DEADZONE) / (1.0 - STICK_DEADZONE)).min(1.0);
+            [v[0] / len * scaled, v[1] / len * scaled]
+        };
+        let sprint = pad.is_pressed(Button::LeftThumb);
+        (stick(Axis::LeftStickX, Axis::LeftStickY), stick(Axis::RightStickX, Axis::RightStickY), sprint)
+    }
+
     fn update(&mut self, dt: f32) {
+        let (left, right_stick, pad_sprint) = self.pad();
+        // Squared response gives fine control near the center and full speed at the edge.
+        let curve = |v: f32| v * v.abs();
+        self.cam.yaw += curve(right_stick[0]) * PAD_LOOK_SPEED * dt;
+        self.cam.pitch = (self.cam.pitch - curve(right_stick[1]) * PAD_LOOK_SPEED * 0.75 * dt).clamp(-89.9, 89.9);
+
         let held = |k| self.keys.contains(&k);
-        let speed = if held(KeyCode::ControlLeft) { 30.0 } else { 10.0 } * dt as f64;
+        let sprint = held(KeyCode::ControlLeft) || pad_sprint;
+        let speed = if sprint { 30.0 } else { 10.0 } * dt as f64;
         let y = self.cam.yaw.to_radians() as f64;
         let forward = [-y.sin(), 0.0, y.cos()];
         let right = [-y.cos(), 0.0, -y.sin()];
@@ -226,10 +268,14 @@ impl App {
         if held(KeyCode::KeyA) { add(right, -1.0) }
         if held(KeyCode::Space) { add([0.0, 1.0, 0.0], 1.0) }
         if held(KeyCode::ShiftLeft) { add([0.0, -1.0, 0.0], 1.0) }
+        add(forward, left[1] as f64);
+        add(right, left[0] as f64);
+        // Keys give full speed, the stick gives up to full speed; never faster than either.
         let len = (mv[0] * mv[0] + mv[1] * mv[1] + mv[2] * mv[2]).sqrt();
         if len > 0.0 {
+            let scale = speed / len.max(1.0);
             for i in 0..3 {
-                self.cam.eye[i] += mv[i] / len * speed;
+                self.cam.eye[i] += mv[i] * scale;
             }
         }
         if self.in_world && self.last_send.elapsed() >= Duration::from_millis(50) {
