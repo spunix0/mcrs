@@ -22,9 +22,11 @@ pub struct Paths {
 }
 
 impl Paths {
+    /// `%USERPROFILE%\mcrs\data`. Not under AppData: packaged apps (like the Claude desktop app) get
+    /// AppData writes redirected into private storage, which other programs then can't see.
     pub fn new() -> Self {
         let root = directories::BaseDirs::new()
-            .map(|d| d.data_dir().join("mcrs"))
+            .map(|d| d.home_dir().join("mcrs").join("data"))
             .unwrap_or_else(|| PathBuf::from("mcrs-data"));
         Self { root }
     }

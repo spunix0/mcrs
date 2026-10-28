@@ -1,6 +1,6 @@
 ﻿//! Game client: window and input loop (winit, gilrs), prediction and player physics, ties the other crates together.
 //!
-//! For now it runs headless: `mc-client --connect 127.0.0.1:25565 --name Player [--say "hi"] [--for 30]`.
+//! For now it runs headless: `mc-client --connect 127.0.0.1:25565 --name Player [--say "hi"] [--for 30] [--greet]`.
 //! Lines typed on stdin are sent as chat (or as commands when they start with `/`).
 
 mod session;
@@ -59,7 +59,8 @@ fn run() -> Result<()> {
         });
     }
 
-    session::run(&addr, &name, stats.clone(), tx, rx)?;
+    let greet = args.iter().any(|a| a == "--greet");
+    session::run(&addr, &name, greet, stats.clone(), tx, rx)?;
     println!("{} chunks received", stats.chunks.load(Relaxed));
     Ok(())
 }

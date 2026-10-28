@@ -32,5 +32,6 @@ No external dependencies yet; add them per crate as each milestone starts.
 6. One-click singleplayer via local server
 
 ## Gotchas
-- Build output goes to `C:/Users/nooak/AppData/Local/mcrs-target` (see `.cargo/config.toml`). The project path is long and hits Windows MAX_PATH.
+- Everything lives in `C:\Users\nooak\mcrs`: `build` (cargo target, see `.cargo/config.toml`), `data` (launcher installs, game dir), `server` (local test server). The project path is long and hits Windows MAX_PATH.
+- Never write under AppData from the Claude desktop app: it's a packaged app, so AppData writes get redirected into its private storage (`AppData\Local\Packages\Claude_*\LocalCache`) and other programs can't see them.
 - Windows PowerShell 5.1 can't list the deep `reference` folders; use Grep/Glob or `\\?\` paths.

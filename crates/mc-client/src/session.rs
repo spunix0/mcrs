@@ -54,7 +54,7 @@ pub fn send_chat(tx: &Sender, line: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn run(addr: &str, name: &str, stats: Arc<Stats>, tx: Sender, mut rx: mc_protocol::Receiver) -> Result<()> {
+pub fn run(addr: &str, name: &str, greet: bool, stats: Arc<Stats>, tx: Sender, mut rx: mc_protocol::Receiver) -> Result<()> {
     let (host, port) = addr.rsplit_once(':').map_or((addr, 25565), |(h, p)| (h, p.parse().unwrap_or(25565)));
     tx.send(handshake::INTENTION, &Writer::new().varint(PROTOCOL_VERSION).string(host).u16(port).varint(2).buf)?;
     tx.send(login::c2s::HELLO, &Writer::new().string(name).uuid(offline_uuid(name)).buf)?;
@@ -153,7 +153,17 @@ pub fn run(addr: &str, name: &str, stats: Arc<Stats>, tx: Sender, mut rx: mc_pro
                 }
             }
             (State::Play, play::s2c::SET_HEALTH) => println!("health {:.1}", r.f32()?),
-            (State::Play, play::s2c::SYSTEM_CHAT) => println!("[chat] {}", component(&mut r)),
+            (State::Play, play::s2c::SYSTEM_CHAT) => {
+                let msg = component(&mut r);
+                println!("[chat] {msg}");
+                if greet {
+                    if let Some(who) = msg.strip_prefix("multiplayer.player.joined [").and_then(|s| s.strip_suffix(']')) {
+                        if who != name {
+                            send_chat(&tx, &format!("Hi {who}! I'm {name}, a Minecraft client written in Rust."))?;
+                        }
+                    }
+                }
+            }
             (State::Play, play::s2c::DISCONNECT) => {
                 println!("disconnected by server: {}", component(&mut r));
                 return Ok(());

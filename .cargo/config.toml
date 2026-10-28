@@ -1,3 +1,4 @@
 ﻿# Keep build output on a short path: the project folder path is long and MSVC/Windows tools hit MAX_PATH.
+# Not under AppData: packaged apps get AppData writes redirected where other programs can't see them.
 [build]
-target-dir = "C:/Users/nooak/AppData/Local/mcrs-target"
+target-dir = "C:/Users/nooak/mcrs/build"
