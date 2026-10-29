@@ -6,6 +6,7 @@
 //! `--headless [--say "hi"] [--for 30] [--greet]` runs without a window; stdin lines are sent as chat.
 
 mod app;
+mod audio;
 mod hud;
 mod inventory;
 mod physics;
@@ -82,6 +83,7 @@ fn run() -> Result<()> {
     let noclip = !args.iter().any(|a| a == "--no-noclip");
     let mut app = app::App::new(started, models, net_rx, tx, vsync, noclip, view_distance);
     app.join_commands = args.windows(2).filter(|w| w[0] == "--run").map(|w| w[1].clone()).collect();
+    app.audio = audio::Audio::new(&data, "26.3").map_err(|e| eprintln!("sound disabled: {e:#}")).ok();
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -135,6 +137,7 @@ fn headless(args: &[String], addr: &str, name: &str, greet: bool) -> Result<()> 
         Event::Health(h) => println!("health {h:.1}"),
         Event::Forget(..) | Event::Blocks(_) | Event::Light(..) => {}
         Event::Inventory(_) | Event::InventorySlot(..) | Event::PlayerSlot(..) | Event::HeldSlot(_) => {}
+        Event::Sound { .. } | Event::LevelEvent { .. } => {}
     })?;
     println!("disconnected: {reason}");
     println!("{} chunks received", chunks.load(Relaxed));

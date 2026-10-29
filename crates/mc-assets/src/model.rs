@@ -364,10 +364,12 @@ impl Baker {
 
     /// Loads every referenced texture (plus fluids) and packs the atlas.
     pub fn stitch(&mut self, jar: &mut Jar) -> anyhow::Result<Atlas> {
-        for extra in ["minecraft:block/water_still", "minecraft:block/lava_still"] {
-            if !self.texture_ids.contains_key(extra) {
-                self.texture_ids.insert(extra.to_string(), self.textures.len());
-                self.textures.push(extra.to_string());
+        let fluids = ["minecraft:block/water_still".to_string(), "minecraft:block/lava_still".to_string()];
+        let cracks = (0..10).map(|i| format!("minecraft:block/destroy_stage_{i}"));
+        for extra in fluids.into_iter().chain(cracks) {
+            if !self.texture_ids.contains_key(&extra) {
+                self.texture_ids.insert(extra.clone(), self.textures.len());
+                self.textures.push(extra);
             }
         }
         Atlas::build(jar, &self.textures)

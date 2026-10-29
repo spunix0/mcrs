@@ -67,7 +67,11 @@ const MAX_GUI_VERTICES: u64 = 65536;
 pub struct Overlay {
     pub world: Vec<LineVertex>,
     pub top: Vec<LineVertex>,
+    /// Blended, depth-tested triangles in world space (block cracks), 3 vertices each.
+    pub quads: Vec<Vertex>,
 }
+
+const MAX_OVERLAY_VERTICES: u64 = 4096;
 
 pub struct FrameStats {
     pub drawn: usize,
@@ -91,6 +95,7 @@ pub struct Renderer {
     gui_pipeline: wgpu::RenderPipeline,
     gui_bind_group: wgpu::BindGroup,
     gui_buffer: wgpu::Buffer,
+    overlay_buffer: wgpu::Buffer,
     uniforms: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     chunks: HashMap<(i32, i32), GpuChunk>,
@@ -372,6 +377,12 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let overlay_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("overlay quads"),
+            size: MAX_OVERLAY_VERTICES * std::mem::size_of::<Vertex>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let lines_world = make_lines("outline", wgpu::CompareFunction::LessEqual);
         let lines_top = make_lines("crosshair", wgpu::CompareFunction::Always);
         let line_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -396,6 +407,7 @@ impl Renderer {
             gui_pipeline,
             gui_bind_group,
             gui_buffer,
+            overlay_buffer,
             uniforms,
             bind_group,
             chunks: HashMap::new(),
@@ -466,6 +478,10 @@ impl Renderer {
         if line_count > 0 {
             self.queue.write_buffer(&self.line_buffer, 0, bytemuck::cast_slice(&lines));
         }
+        let quad_count = overlay.quads.len().min(MAX_OVERLAY_VERTICES as usize) / 3 * 3;
+        if quad_count > 0 {
+            self.queue.write_buffer(&self.overlay_buffer, 0, bytemuck::cast_slice(&overlay.quads[..quad_count]));
+        }
         let gui_count = gui.vertices.len().min(MAX_GUI_VERTICES as usize);
         if gui_count > 0 {
             self.queue.write_buffer(&self.gui_buffer, 0, bytemuck::cast_slice(&gui.vertices[..gui_count]));
@@ -523,6 +539,11 @@ impl Renderer {
                     pass.set_index_buffer(m.indices.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..m.count, 0, 0..1);
                 }
+            }
+            if quad_count > 0 {
+                // Still on the translucent pipeline and block atlas from the pass above.
+                pass.set_vertex_buffer(0, self.overlay_buffer.slice(..));
+                pass.draw(0..quad_count as u32, 0..1);
             }
             if line_count > 0 {
                 pass.set_vertex_buffer(0, self.line_buffer.slice(..));

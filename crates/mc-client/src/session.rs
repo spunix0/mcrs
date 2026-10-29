@@ -28,10 +28,34 @@ pub enum Event {
     /// One slot in the inventory's own order (`set_player_inventory`).
     PlayerSlot(usize, Option<Stack>),
     HeldSlot(u8),
+    /// A sound from the server; `at` is `None` for sounds attached to entities we don't track yet.
+    Sound { event: SoundRef, at: Option<[f64; 3]>, volume: f32, pitch: f32 },
+    /// World events such as 2001 (block broken by someone else, `data` = block state).
+    LevelEvent { kind: i32, pos: [i32; 3], data: i32 },
     /// Server moved us: feet position and yaw/pitch.
     Teleport([f64; 3], [f32; 2]),
     Chat(String),
     Health(f32),
+}
+
+/// A sound event either by registry ID or spelled out (custom sounds).
+pub enum SoundRef {
+    Id(u32),
+    Name(String),
+}
+
+/// `Holder<SoundEvent>`: 0 means an inline event (name + optional fixed range), otherwise registry ID + 1.
+fn sound_ref(r: &mut Reader) -> Result<SoundRef> {
+    let h = r.varint()?;
+    if h == 0 {
+        let name = r.string()?;
+        if r.bool()? {
+            r.f32()?;
+        }
+        Ok(SoundRef::Name(name))
+    } else {
+        Ok(SoundRef::Id(h as u32 - 1))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -304,6 +328,22 @@ pub fn run(opts: &Options, tx: Sender, mut rx: mc_protocol::Receiver, mut emit: 
                     let item = stack(&mut r, comps, &mut ok);
                     emit(Event::PlayerSlot(index.max(0) as usize, item));
                 }
+            }
+            (State::Play, play::s2c::SOUND) => {
+                let event = sound_ref(&mut r)?;
+                let _source = r.varint()?;
+                let at = [r.i32()? as f64 / 8.0, r.i32()? as f64 / 8.0, r.i32()? as f64 / 8.0];
+                emit(Event::Sound { event, at: Some(at), volume: r.f32()?, pitch: r.f32()? });
+            }
+            (State::Play, play::s2c::SOUND_ENTITY) => {
+                let event = sound_ref(&mut r)?;
+                let (_source, _entity) = (r.varint()?, r.varint()?);
+                emit(Event::Sound { event, at: None, volume: r.f32()?, pitch: r.f32()? });
+            }
+            (State::Play, play::s2c::LEVEL_EVENT) => {
+                let kind = r.i32()?;
+                let pos = mc_world::unpack_block_pos(r.i64()?);
+                emit(Event::LevelEvent { kind, pos, data: r.i32()? });
             }
             (State::Play, play::s2c::SET_HELD_SLOT) => emit(Event::HeldSlot(r.varint()?.clamp(0, 8) as u8)),
             (State::Play, play::s2c::FORGET_LEVEL_CHUNK) => {

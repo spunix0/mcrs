@@ -65,6 +65,9 @@ pub mod play {
         pub const SET_HELD_SLOT: i32 = 107;
         pub const SET_PLAYER_INVENTORY: i32 = 110;
         pub const LIGHT_UPDATE: i32 = 49;
+        pub const LEVEL_EVENT: i32 = 47;
+        pub const SOUND_ENTITY: i32 = 118;
+        pub const SOUND: i32 = 119;
         pub const SECTION_BLOCKS_UPDATE: i32 = 86;
         pub const CHUNK_BATCH_FINISHED: i32 = 11;
         pub const CHUNK_BATCH_START: i32 = 12;

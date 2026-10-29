@@ -3,7 +3,8 @@
 use crate::hud::{self, Painter};
 use crate::inventory::Inventory;
 use crate::physics::{self, Aabb, Body, Input};
-use crate::session::{self, Dig, Event};
+use crate::audio::Audio;
+use crate::session::{self, Dig, Event, SoundRef};
 use crate::target::{self, Hit};
 use gilrs::{Axis, Button, Gilrs};
 use glam::{Mat4, Vec3};
@@ -160,6 +161,13 @@ pub struct App {
     inventory: Inventory,
     /// Chat lines or commands to send once in the world (`--run`).
     pub join_commands: Vec<String>,
+    /// `None` if there's no audio device or the sound assets are missing.
+    pub audio: Option<Audio>,
+    /// Where a block should appear after our last right-click, to play its place sound when the server confirms it.
+    pending_place: Option<([i32; 3], Instant)>,
+    /// Vanilla's `moveDist` / `nextStep` for footstep sounds.
+    walked: f64,
+    next_step: f64,
     /// Cursor position in window pixels (for menus).
     mouse_pos: (f32, f32),
     last_frame: Instant,
@@ -229,6 +237,10 @@ impl App {
             inventory_open: false,
             inventory: Inventory::default(),
             join_commands: Vec::new(),
+            audio: None,
+            pending_place: None,
+            walked: 0.0,
+            next_step: 1.0,
             mouse_pos: (0.0, 0.0),
             last_frame: Instant::now(),
             frames: 0,
@@ -309,6 +321,11 @@ impl App {
                         let Some(chunk) = self.world.get_mut(&(cx, cz)) else { continue };
                         let (lx, lz) = (x.rem_euclid(16), z.rem_euclid(16));
                         Arc::make_mut(chunk).set(lx as usize, y, lz as usize, state);
+                        let placed = self.pending_place.is_some_and(|(p, t)| p == [x, y, z] && t.elapsed() < Duration::from_secs(1));
+                        if placed && state != 0 {
+                            self.pending_place = None;
+                            self.block_sound([x, y, z], Some(state), |s| &s.place, |v| (v + 1.0) / 2.0, 0.8);
+                        }
                         // A block affects meshes of every chunk whose 1-block border it sits in.
                         let xs = [-1, 0, 1].into_iter().filter(|d| *d == 0 || (*d == -1 && lx == 0) || (*d == 1 && lx == 15));
                         for dx in xs {
@@ -335,6 +352,20 @@ impl App {
                     self.cam.pitch = rot[1];
                 }
                 Event::Chat(msg) => println!("[chat] {msg}"),
+                Event::Sound { event, at, volume, pitch } => {
+                    let name = match event {
+                        SoundRef::Id(id) => self.models.sound_events.get(id as usize).cloned(),
+                        SoundRef::Name(n) => Some(n),
+                    };
+                    if let (Some(name), Some(a)) = (name, &mut self.audio) {
+                        a.play(&name, at, volume, pitch);
+                    }
+                }
+                // 2001: someone else broke a block (data = its state).
+                Event::LevelEvent { kind: 2001, pos, data } => {
+                    self.block_sound(pos, Some(data as u16), |s| &s.break_, |v| (v + 1.0) / 2.0, 0.8);
+                }
+                Event::LevelEvent { .. } => {}
                 Event::Health(_) => {}
                 Event::Inventory(items) => {
                     for (slot, item) in items.into_iter().enumerate().take(self.inventory.slots.len()) {
@@ -389,8 +420,8 @@ impl App {
             let scaled = ((len - STICK_DEADZONE) / (1.0 - STICK_DEADZONE)).min(1.0);
             [v[0] / len * scaled, v[1] / len * scaled]
         };
-        // Triggers are analog on most pads; treat past half-pull as pressed.
-        let trigger = |b: Button| pad.button_data(b).map_or(pad.is_pressed(b), |d| d.value() > 0.5);
+        // Triggers are analog (WGI reports them as axes); count anything past a light pull.
+        let trigger = |b: Button| pad.is_pressed(b) || pad.button_data(b).is_some_and(|d| d.value() > 0.3);
         Pad {
             left: stick(Axis::LeftStickX, Axis::LeftStickY),
             right: stick(Axis::RightStickX, Axis::RightStickY),
@@ -448,6 +479,20 @@ impl App {
         let _ = session::send_hotbar_slot(&self.tx, self.slot);
     }
 
+    /// Plays one of a block's sounds (break/hit/place/step) at its center, with vanilla's volume and pitch for that use.
+    fn block_sound(&mut self, pos: [i32; 3], state: Option<u16>, which: fn(&mc_assets::SoundSet) -> &str, volume: fn(f32) -> f32, pitch: f32) {
+        let world = WorldView { chunks: &self.world, models: &self.models };
+        let state = match state {
+            Some(s) => self.models.states.get(s as usize),
+            None => world.state(pos[0], pos[1], pos[2]),
+        };
+        let Some(set) = state.and_then(|s| self.models.sound_types.get(&*s.sound)).cloned() else { return };
+        let at = [pos[0] as f64 + 0.5, pos[1] as f64 + 0.5, pos[2] as f64 + 0.5];
+        if let Some(a) = &mut self.audio {
+            a.play(which(&set), Some(at), volume(set.volume), set.pitch * pitch);
+        }
+    }
+
     fn next_sequence(&mut self) -> i32 {
         self.sequence += 1;
         self.sequence
@@ -482,6 +527,8 @@ impl App {
                 let _ = session::send_dig(&self.tx, Dig::Abort, m.pos, m.face, seq);
             }
         } else if self.mine_cooldown == 0 {
+            // (position, broke it?) — sounds are played after the match to keep the borrow of `mining` short.
+            let mut sound: Option<([i32; 3], bool)> = None;
             match (target, &mut self.mining) {
                 (Some((pos, _, _)), Some(m)) if m.pos == pos => {
                     m.ticks += 1;
@@ -491,6 +538,9 @@ impl App {
                         let seq = self.next_sequence();
                         let _ = session::send_dig(&self.tx, Dig::Stop, pos, face, seq);
                         self.mine_cooldown = MINE_COOLDOWN;
+                        sound = Some((pos, true));
+                    } else if m.ticks % 4 == 0 {
+                        sound = Some((pos, false));
                     }
                 }
                 (Some((pos, face, _)), _) => {
@@ -499,15 +549,18 @@ impl App {
                         let _ = session::send_dig(&self.tx, Dig::Abort, m.pos, m.face, seq);
                     }
                     let world = WorldView { chunks: &self.world, models: &self.models };
-                    let needed = world.state(pos[0], pos[1], pos[2]).and_then(|s| s.break_ticks(self.body.on_ground));
+                    let tool = self.inventory.hotbar(self.slot as usize).and_then(|s| self.models.items.get(s.item as usize)).and_then(|i| i.tool);
+                    let needed = world.state(pos[0], pos[1], pos[2]).and_then(|s| s.break_ticks(tool.as_ref(), self.body.on_ground));
                     if let Some(needed) = needed {
                         let seq = self.next_sequence();
                         let _ = session::send_dig(&self.tx, Dig::Start, pos, face, seq);
                         if needed <= 1 {
                             // Breaks instantly (grass, flowers, torches).
                             self.mine_cooldown = MINE_COOLDOWN;
+                            sound = Some((pos, true));
                         } else {
                             self.mining = Some(Mining { pos, face, ticks: 1, needed });
+                            sound = Some((pos, false));
                         }
                     }
                 }
@@ -518,12 +571,22 @@ impl App {
                     }
                 }
             }
+            // The server leaves the breaker out of its break broadcast, so the client plays these itself (vanilla too).
+            match sound {
+                Some((pos, true)) => self.block_sound(pos, None, |s| &s.break_, |v| (v + 1.0) / 2.0, 0.8),
+                Some((pos, false)) => self.block_sound(pos, None, |s| &s.hit, |v| (v + 1.0) / 8.0, 0.5),
+                None => {}
+            }
         }
 
         if use_item && self.use_cooldown == 0 {
             let seq = self.next_sequence();
             let _ = match target {
-                Some((pos, face, point)) => session::send_use_on(&self.tx, pos, face, point, seq),
+                Some((pos, face, point)) => {
+                    let o = [[0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]][face as usize % 6];
+                    self.pending_place = Some(([pos[0] + o[0], pos[1] + o[1], pos[2] + o[2]], Instant::now()));
+                    session::send_use_on(&self.tx, pos, face, point, seq)
+                }
                 None => session::send_use(&self.tx, seq, [self.cam.yaw, self.cam.pitch]),
             };
             self.use_cooldown = USE_COOLDOWN;
@@ -566,6 +629,30 @@ impl App {
                 for (a, b) in [(0, 1), (2, 3), (4, 5), (6, 7), (0, 2), (1, 3), (4, 6), (5, 7), (0, 4), (1, 5), (2, 6), (3, 7)] {
                     o.world.push(LineVertex { pos: p(a), color: c });
                     o.world.push(LineVertex { pos: p(b), color: c });
+                }
+            }
+        }
+        // Cracks on the block being mined, one of vanilla's 10 destroy stages by progress.
+        if let (Some(m), Some(t)) = (&self.mining, &self.target) {
+            if m.pos == t.pos {
+                let stage = (m.ticks * 10 / m.needed.max(1)).min(9) as usize;
+                let [u0, v0, u1, v1] = self.models.crack_uv[stage];
+                for b in &t.boxes {
+                    let (lo, hi) = (b.min.map(|v| v as f32 - 0.003), b.max.map(|v| v as f32 + 0.003));
+                    for axis in 0..3 {
+                        for side in [lo[axis], hi[axis]] {
+                            let (a, c) = ((axis + 1) % 3, (axis + 2) % 3);
+                            let corner = |i: f32, j: f32| {
+                                let mut p = [0.0; 3];
+                                p[axis] = side;
+                                p[a] = if i == 0.0 { lo[a] } else { hi[a] };
+                                p[c] = if j == 0.0 { lo[c] } else { hi[c] };
+                                mc_render::Vertex { pos: p, uv: [u0 + (u1 - u0) * i, v0 + (v1 - v0) * j], color: [255, 255, 255, 255] }
+                            };
+                            let q = [corner(0.0, 0.0), corner(0.0, 1.0), corner(1.0, 1.0), corner(1.0, 0.0)];
+                            o.quads.extend_from_slice(&[q[0], q[1], q[2], q[0], q[2], q[3]]);
+                        }
+                    }
                 }
             }
         }
@@ -646,6 +733,17 @@ impl App {
             self.prev_feet = self.body.pos;
             let world = WorldView { chunks: &self.world, models: &self.models };
             self.body.tick(input, self.cam.yaw, &world);
+            // Footsteps like vanilla: walked distance * 0.6, one step sound per whole unit, from the block underfoot.
+            let (dx, dz) = (self.body.pos[0] - self.prev_feet[0], self.body.pos[2] - self.prev_feet[2]);
+            if self.body.on_ground && !input.sneak {
+                self.walked += (dx * dx + dz * dz).sqrt() * 0.6;
+                if self.walked > self.next_step {
+                    self.next_step = self.walked.floor() + 1.0;
+                    let [x, y, z] = self.body.pos;
+                    let below = [x.floor() as i32, (y - 0.2).floor() as i32, z.floor() as i32];
+                    self.block_sound(below, None, |s| &s.step, |v| v * 0.15, 1.0);
+                }
+            }
             let flags = self.body.on_ground as u8 | (self.body.horizontal_collision as u8) << 1;
             let _ = session::send_tick(&self.tx, self.body.pos, [self.cam.yaw, self.cam.pitch], flags);
         }
@@ -695,6 +793,12 @@ impl App {
         self.drain();
         self.update(dt);
         self.update_target();
+        if let Some(a) = &mut self.audio {
+            a.set_listener(self.cam.eye, self.cam.yaw);
+            if self.in_world {
+                a.tick_music();
+            }
+        }
         let mut overlay = self.overlay(self.renderer.as_ref().map_or(720, Renderer::height));
         let (w, h) = self.window.as_ref().map_or((1280, 720), |w| (w.inner_size().width, w.inner_size().height));
         let mut painter = Painter::new(&self.models, w, h);
