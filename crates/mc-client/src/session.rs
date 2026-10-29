@@ -4,6 +4,7 @@
 use anyhow::{Result, bail};
 use mc_protocol::ids::{config, handshake, login, play};
 use mc_protocol::{PROTOCOL_VERSION, Reader, Sender, Writer, text};
+use crate::inventory::{Components, Stack, read_stack};
 use mc_world::{Chunk, LightUpdate, Registries};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -20,6 +21,13 @@ pub enum Event {
     /// Block changes as (world position, new state).
     Blocks(Vec<([i32; 3], u16)>),
     Light(i32, i32, LightUpdate),
+    /// Full player inventory (container 0, menu slot order).
+    Inventory(Vec<Option<Stack>>),
+    /// One menu slot of container 0.
+    InventorySlot(usize, Option<Stack>),
+    /// One slot in the inventory's own order (`set_player_inventory`).
+    PlayerSlot(usize, Option<Stack>),
+    HeldSlot(u8),
     /// Server moved us: feet position and yaw/pitch.
     Teleport([f64; 3], [f32; 2]),
     Chat(String),
@@ -122,6 +130,23 @@ pub struct Options<'a> {
     pub drives_movement: bool,
     /// Chunk radius to ask the server for (it caps this at its own view-distance).
     pub view_distance: u8,
+    /// Needed to read item stacks; without it inventory packets are ignored.
+    pub components: Option<&'a Components>,
+}
+
+/// Reads one stack; an unknown component keeps the stack but means the rest of the packet can't be trusted.
+fn stack(r: &mut Reader, comps: &Components, ok: &mut bool) -> Option<Stack> {
+    if !*ok {
+        return None;
+    }
+    match read_stack(r, comps) {
+        Ok(s) => s,
+        Err((s, e)) => {
+            eprintln!("item with unsupported component {}; skipping the rest of this inventory packet", e.0);
+            *ok = false;
+            s
+        }
+    }
 }
 
 /// Runs until the server disconnects us; returns the disconnect reason.
@@ -251,6 +276,36 @@ pub fn run(opts: &Options, tx: Sender, mut rx: mc_protocol::Receiver, mut emit: 
                 Ok((x, z, light)) => emit(Event::Light(x, z, light)),
                 Err(e) => emit(Event::Chat(format!("couldn't decode a light update: {e}"))),
             },
+            (State::Play, play::s2c::CONTAINER_SET_CONTENT) => {
+                if let Some(comps) = opts.components {
+                    if r.varint()? == 0 {
+                        let _state_id = r.varint()?;
+                        let n = r.len()?;
+                        let mut ok = true;
+                        let items = (0..n).map(|_| stack(&mut r, comps, &mut ok)).collect();
+                        emit(Event::Inventory(items));
+                    }
+                }
+            }
+            (State::Play, play::s2c::CONTAINER_SET_SLOT) => {
+                if let Some(comps) = opts.components {
+                    let (container, _state_id, slot) = (r.varint()?, r.varint()?, r.i16()?);
+                    let mut ok = true;
+                    let item = stack(&mut r, comps, &mut ok);
+                    if container == 0 && slot >= 0 {
+                        emit(Event::InventorySlot(slot as usize, item));
+                    }
+                }
+            }
+            (State::Play, play::s2c::SET_PLAYER_INVENTORY) => {
+                if let Some(comps) = opts.components {
+                    let index = r.varint()?;
+                    let mut ok = true;
+                    let item = stack(&mut r, comps, &mut ok);
+                    emit(Event::PlayerSlot(index.max(0) as usize, item));
+                }
+            }
+            (State::Play, play::s2c::SET_HELD_SLOT) => emit(Event::HeldSlot(r.varint()?.clamp(0, 8) as u8)),
             (State::Play, play::s2c::FORGET_LEVEL_CHUNK) => {
                 let packed = r.i64()?;
                 emit(Event::Forget(packed as i32, (packed >> 32) as i32));

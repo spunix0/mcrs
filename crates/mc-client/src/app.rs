@@ -1,5 +1,7 @@
 //! The window: fly camera, chunk meshing on worker threads, rendering, and movement packets back to the server.
 
+use crate::hud::{self, Painter};
+use crate::inventory::Inventory;
 use crate::physics::{self, Aabb, Body, Input};
 use crate::session::{self, Dig, Event};
 use crate::target::{self, Hit};
@@ -155,6 +157,11 @@ pub struct App {
     use_cooldown: u8,
     target: Option<Hit>,
     inventory_open: bool,
+    inventory: Inventory,
+    /// Chat lines or commands to send once in the world (`--run`).
+    pub join_commands: Vec<String>,
+    /// Cursor position in window pixels (for menus).
+    mouse_pos: (f32, f32),
     last_frame: Instant,
     frames: u32,
     fps_since: Instant,
@@ -220,6 +227,9 @@ impl App {
             use_cooldown: 0,
             target: None,
             inventory_open: false,
+            inventory: Inventory::default(),
+            join_commands: Vec::new(),
+            mouse_pos: (0.0, 0.0),
             last_frame: Instant::now(),
             frames: 0,
             fps_since: Instant::now(),
@@ -276,6 +286,9 @@ impl App {
                     self.in_world = true;
                     self.status = "in world".into();
                     self.request_gamemode();
+                    for cmd in std::mem::take(&mut self.join_commands) {
+                        let _ = session::send_chat(&self.tx, &cmd);
+                    }
                 }
                 Event::Chunk(c) => {
                     let key = (c.x, c.z);
@@ -323,6 +336,18 @@ impl App {
                 }
                 Event::Chat(msg) => println!("[chat] {msg}"),
                 Event::Health(_) => {}
+                Event::Inventory(items) => {
+                    for (slot, item) in items.into_iter().enumerate().take(self.inventory.slots.len()) {
+                        self.inventory.slots[slot] = item;
+                    }
+                }
+                Event::InventorySlot(slot, item) => {
+                    if let Some(s) = self.inventory.slots.get_mut(slot) {
+                        *s = item;
+                    }
+                }
+                Event::PlayerSlot(index, item) => self.inventory.set_player_slot(index, item),
+                Event::HeldSlot(slot) => self.slot = slot,
             }
         }
         self.dispatch();
@@ -428,10 +453,15 @@ impl App {
         self.sequence
     }
 
-    // No inventory screen exists yet (milestone 5); these keep the buttons wired so the GUI can take them over.
+    /// Opens or closes the inventory screen. Open frees the mouse; closing tells the server, like vanilla.
     fn toggle_inventory(&mut self) {
         self.inventory_open = !self.inventory_open;
-        println!("[ui] inventory {} (the screen itself comes with the GUI milestone)", if self.inventory_open { "open" } else { "closed" });
+        if self.inventory_open {
+            self.set_grab(false);
+        } else {
+            let _ = self.tx.send(mc_protocol::ids::play::c2s::CONTAINER_CLOSE, &mc_protocol::Writer::new().varint(0).buf);
+            self.set_grab(true);
+        }
     }
 
     fn back(&mut self) {
@@ -561,7 +591,7 @@ impl App {
         let pad = self.pad();
         let prev = std::mem::replace(&mut self.prev_pad, pad);
         let pressed = |now: bool, before: bool| now && !before;
-        if pressed(pad.jump, prev.jump) {
+        if pressed(pad.jump, prev.jump) && !self.inventory_open {
             self.jump_pressed();
         }
         if pressed(pad.next_slot, prev.next_slot) {
@@ -576,14 +606,17 @@ impl App {
         if pressed(pad.back, prev.back) {
             self.back();
         }
+        // A menu takes all input; the world keeps simulating (you still fall) but you don't move or act.
+        let pad = if self.inventory_open { Pad::default() } else { pad };
         let (left, right_stick, pad_sprint, rise, lower) = (pad.left, pad.right, pad.sprint, pad.jump, pad.sneak);
-        let (mine, use_item) = (self.mouse_mine || pad.mine, self.mouse_use || pad.use_item);
+        let in_world_input = !self.inventory_open;
+        let (mine, use_item) = (in_world_input && (self.mouse_mine || pad.mine), in_world_input && (self.mouse_use || pad.use_item));
         // Squared response gives fine control near the center and full speed at the edge.
         let curve = |v: f32| v * v.abs();
         self.cam.yaw += curve(right_stick[0]) * PAD_LOOK_SPEED * dt;
         self.cam.pitch = (self.cam.pitch - curve(right_stick[1]) * PAD_LOOK_SPEED * 0.75 * dt).clamp(-89.9, 89.9);
 
-        let held = |k| self.keys.contains(&k);
+        let held = |k| in_world_input && self.keys.contains(&k);
         let sprint = held(KeyCode::ControlLeft) || pad_sprint;
         let axis = |pos: KeyCode, neg: KeyCode, stick: f32| ((held(pos) as i32 - held(neg) as i32) as f32 + stick).clamp(-1.0, 1.0);
         let input = Input {
@@ -662,14 +695,24 @@ impl App {
         self.drain();
         self.update(dt);
         self.update_target();
-        let overlay = self.overlay(self.renderer.as_ref().map_or(720, Renderer::height));
+        let mut overlay = self.overlay(self.renderer.as_ref().map_or(720, Renderer::height));
+        let (w, h) = self.window.as_ref().map_or((1280, 720), |w| (w.inner_size().width, w.inner_size().height));
+        let mut painter = Painter::new(&self.models, w, h);
+        if self.in_world {
+            hud::hotbar(&mut painter, &self.inventory, self.slot);
+        }
+        if self.inventory_open {
+            overlay.top.clear();
+            hud::inventory_screen(&mut painter, &self.inventory, self.mouse_pos);
+        }
+        let gui = painter.gui;
         let Some(r) = &mut self.renderer else { return };
         let eye = Vec3::new(self.cam.eye[0] as f32, self.cam.eye[1] as f32, self.cam.eye[2] as f32);
         let view = glam::camera::rh::view::look_to_mat4(eye, self.cam.look(), Vec3::Y);
         let fog_end = self.view_distance as f32 * 16.0;
         // DirectX convention = wgpu's: Y up in clip space, depth 0..1. Far plane covers the fog distance plus world height.
         let proj: Mat4 = glam::camera::rh::proj::directx::perspective(70f32.to_radians(), r.aspect(), 0.05, fog_end * 1.5 + 400.0);
-        let stats = r.render(proj * view, eye, fog_end, &overlay);
+        let stats = r.render(proj * view, eye, fog_end, &overlay, &gui);
         if !self.first_frame {
             self.first_frame = true;
             println!("first frame after {:?} ({})", self.started.elapsed(), r.adapter_name);
@@ -706,7 +749,7 @@ impl ApplicationHandler for App {
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let size = window.inner_size();
-        match Renderer::new(window.clone(), size.width, size.height, &self.models.atlas, self.vsync) {
+        match Renderer::new(window.clone(), size.width, size.height, &self.models.atlas, &self.models.gui, self.vsync) {
             Ok(r) => self.renderer = Some(r),
             Err(e) => {
                 eprintln!("renderer failed: {e:#}");
@@ -731,7 +774,10 @@ impl ApplicationHandler for App {
                 self.set_grab(false);
             }
             WindowEvent::Focused(true) => self.focused = true,
-            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } if !self.grabbed => self.set_grab(true),
+            WindowEvent::CursorMoved { position, .. } => self.mouse_pos = (position.x as f32, position.y as f32),
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } if !self.grabbed && !self.inventory_open => {
+                self.set_grab(true)
+            }
             WindowEvent::MouseInput { state, button, .. } => {
                 let down = state == ElementState::Pressed;
                 match button {

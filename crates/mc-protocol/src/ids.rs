@@ -45,6 +45,7 @@ pub mod play {
         pub const CHAT_COMMAND: i32 = 7;
         pub const CHAT: i32 = 9;
         pub const CHUNK_BATCH_RECEIVED: i32 = 11;
+        pub const CONTAINER_CLOSE: i32 = 19;
         pub const CLIENT_COMMAND: i32 = 12;
         pub const CLIENT_TICK_END: i32 = 13;
         pub const CONFIGURATION_ACKNOWLEDGED: i32 = 16;
@@ -59,6 +60,10 @@ pub mod play {
     }
     pub mod s2c {
         pub const BLOCK_UPDATE: i32 = 8;
+        pub const CONTAINER_SET_CONTENT: i32 = 18;
+        pub const CONTAINER_SET_SLOT: i32 = 20;
+        pub const SET_HELD_SLOT: i32 = 107;
+        pub const SET_PLAYER_INVENTORY: i32 = 110;
         pub const LIGHT_UPDATE: i32 = 49;
         pub const SECTION_BLOCKS_UPDATE: i32 = 86;
         pub const CHUNK_BATCH_FINISHED: i32 = 11;

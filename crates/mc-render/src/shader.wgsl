@@ -3,6 +3,8 @@ struct Uniforms {
     // xyz = camera position, w = fog end distance
     camera: vec4<f32>,
     sky: vec4<f32>,
+    // xy = window size in pixels
+    screen: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -64,4 +66,26 @@ fn fs_line(i: LineOut) -> @location(0) vec4<f32> {
 fn fs_translucent(i: VOut) -> @location(0) vec4<f32> {
     let t = textureSample(atlas, atlas_sampler, i.uv) * i.color;
     return vec4<f32>(fogged(t.rgb, i.dist), t.a);
+}
+
+struct GuiOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+};
+
+@vertex
+fn vs_gui(@location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>, @location(2) color: vec4<f32>) -> GuiOut {
+    var o: GuiOut;
+    let ndc = pos / u.screen.xy * 2.0 - 1.0;
+    o.clip = vec4<f32>(ndc.x, -ndc.y, 0.0, 1.0);
+    o.uv = uv;
+    o.color = vec4<f32>(pow(color.rgb, vec3<f32>(2.2)), color.a);
+    return o;
+}
+
+@fragment
+fn fs_gui(i: GuiOut) -> @location(0) vec4<f32> {
+    // GUI pixels map to many screen pixels; always sample the full-resolution level.
+    return textureSampleLevel(atlas, atlas_sampler, i.uv, 0.0) * i.color;
 }

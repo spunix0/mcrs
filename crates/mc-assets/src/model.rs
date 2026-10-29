@@ -338,6 +338,30 @@ impl Baker {
         part
     }
 
+    /// Picks a flat icon texture for an item: `layer0` for drawn items, a representative face for block items.
+    /// Registers the texture so it lands in the atlas.
+    pub fn item_icon(&mut self, jar: &mut Jar, item: &str) -> Option<String> {
+        fn first_model(v: &Value) -> Option<String> {
+            match v {
+                Value::Object(o) => {
+                    if let (Some(Value::String(m)), true) = (o.get("model"), o.get("type").and_then(Value::as_str) == Some("minecraft:model")) {
+                        return Some(m.clone());
+                    }
+                    o.values().find_map(first_model)
+                }
+                Value::Array(a) => a.iter().find_map(first_model),
+                _ => None,
+            }
+        }
+        let def = jar.json(&format!("assets/minecraft/items/{item}.json"))?;
+        let model_name = first_model(&def)?;
+        let model = self.resolve(jar, &model_name)?;
+        let key = ["layer0", "all", "side", "front", "north", "texture", "top", "particle"]
+            .into_iter()
+            .find(|k| model.textures.contains_key(*k))?;
+        Some(self.texture(&model, &format!("#{key}")))
+    }
+
     /// Loads every referenced texture (plus fluids) and packs the atlas.
     pub fn stitch(&mut self, jar: &mut Jar) -> anyhow::Result<Atlas> {
         for extra in ["minecraft:block/water_still", "minecraft:block/lava_still"] {

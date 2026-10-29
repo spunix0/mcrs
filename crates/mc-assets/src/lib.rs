@@ -3,6 +3,7 @@
 //! [`BlockModels::load`] turns every block state into baked quads (unit-cube space, atlas UVs) the mesher can copy straight into vertex buffers.
 
 mod atlas;
+mod gui;
 mod model;
 
 use anyhow::{Context, Result};
@@ -14,6 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub use atlas::Atlas;
+pub use gui::{GuiAtlas, Sprite};
 
 /// Face directions in vanilla order: down, up, north, south, west, east.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -172,11 +174,51 @@ fn friction_for(block: &str) -> f32 {
     }
 }
 
+/// An item as the client draws it.
+#[derive(Clone)]
+pub struct ItemInfo {
+    pub name: String,
+    /// Atlas UVs of its flat icon, if one was found.
+    pub icon: Option<[f32; 4]>,
+    /// Grass/foliage tint for icons whose texture is grayscale (leaves, grass, vines).
+    pub tint: Option<[u8; 3]>,
+}
+
 pub struct BlockModels {
     pub states: Vec<StateModel>,
     pub atlas: Atlas,
     pub water_uv: [f32; 4],
     pub lava_uv: [f32; 4],
+    /// Indexed by item protocol ID.
+    pub items: Vec<ItemInfo>,
+    /// Data component type name (without `minecraft:`) to protocol ID.
+    pub components: HashMap<String, u32>,
+    pub gui: GuiAtlas,
+}
+
+/// `(registry name -> entries in protocol-ID order)` from the server's `reports/registries.json`.
+fn load_registry(v: &Value, registry: &str) -> Vec<String> {
+    let mut entries: Vec<(u64, String)> = v[registry]["entries"]
+        .as_object()
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, e)| Some((e["protocol_id"].as_u64()?, k.strip_prefix("minecraft:").unwrap_or(k).to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    entries.sort();
+    entries.into_iter().map(|(_, n)| n).collect()
+}
+
+fn item_tint(item: &str) -> Option<[u8; 3]> {
+    match item {
+        "short_grass" | "tall_grass" | "fern" | "large_fern" | "sugar_cane" => Some(GRASS),
+        "lily_pad" | "vine" | "birch_leaves" | "spruce_leaves" => Some(tint_for(item)),
+        i if i.ends_with("_leaves") && !matches!(i, "cherry_leaves" | "azalea_leaves" | "flowering_azalea_leaves" | "pale_oak_leaves") => {
+            Some(FOLIAGE)
+        }
+        _ => None,
+    }
 }
 
 /// Reads assets straight out of the client jar.
@@ -248,8 +290,16 @@ fn tint_for(block: &str) -> [u8; 3] {
 }
 
 impl BlockModels {
-    pub fn load(jar_path: &Path, blocks_json: &Path) -> Result<Self> {
-        let states = load_states(blocks_json)?;
+    /// `reports` is the server data generator's `reports` folder (`blocks.json`, `registries.json`).
+    pub fn load(jar_path: &Path, reports: &Path) -> Result<Self> {
+        let states = load_states(&reports.join("blocks.json"))?;
+        let registries: Value = serde_json::from_slice(&fs::read(reports.join("registries.json")).context("reading registries.json")?)?;
+        let item_names = load_registry(&registries, "minecraft:item");
+        let components = load_registry(&registries, "minecraft:data_component_type")
+            .into_iter()
+            .enumerate()
+            .map(|(i, n)| (n, i as u32))
+            .collect();
         let mut jar = Jar::open(jar_path)?;
         let mut baker = model::Baker::new();
         let mut blockstate_cache: HashMap<String, Option<Value>> = HashMap::new();
@@ -265,7 +315,14 @@ impl BlockModels {
             let baked: Vec<_> = parts.iter().map(|p| baker.bake(&mut jar, p)).collect();
             resolved.push(baked);
         }
+        let icon_textures: Vec<Option<String>> = item_names.iter().map(|n| baker.item_icon(&mut jar, n)).collect();
         let atlas = baker.stitch(&mut jar)?;
+        let items = item_names
+            .iter()
+            .zip(icon_textures)
+            .map(|(name, tex)| ItemInfo { name: name.clone(), icon: tex.map(|t| atlas.rect(&t)), tint: item_tint(name) })
+            .collect();
+        let gui = GuiAtlas::load(&mut jar)?;
         let water_uv = atlas.rect("minecraft:block/water_still");
         let lava_uv = atlas.rect("minecraft:block/lava_still");
 
@@ -302,6 +359,6 @@ impl BlockModels {
                 }
             })
             .collect();
-        Ok(Self { states, atlas, water_uv, lava_uv })
+        Ok(Self { states, atlas, water_uv, lava_uv, items, components, gui })
     }
 }

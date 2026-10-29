@@ -1,10 +1,13 @@
 ﻿//! Game client: window and input loop (winit, gilrs), prediction and player physics, ties the other crates together.
 //!
 //! `mc-client [--connect 127.0.0.1:25565] [--name Player] [--view-distance 8] [--no-vsync] [--no-noclip]` opens a window and renders the world.
-//! It asks to become a spectator on join so the camera can fly through blocks (needs operator rights on the server).
+//! Starts walking (survival); double-tap jump or F to fly (spectator noclip, needs operator rights on the server).
+//! `--run "/give @s stone 64"` (repeatable) sends a chat line or command after joining.
 //! `--headless [--say "hi"] [--for 30] [--greet]` runs without a window; stdin lines are sent as chat.
 
 mod app;
+mod hud;
+mod inventory;
 mod physics;
 mod session;
 mod target;
@@ -41,10 +44,10 @@ fn run() -> Result<()> {
         PathBuf::from(std::env::var("USERPROFILE").unwrap_or_default()).join("mcrs").join("data")
     });
     let jar = data.join("versions").join("26.3").join("26.3.jar");
-    let blocks = data.join("reports").join("blocks.json");
+    let reports = data.join("reports");
 
     // Load assets and connect at the same time.
-    let assets = std::thread::spawn(move || mc_assets::BlockModels::load(&jar, &blocks));
+    let assets = std::thread::spawn(move || mc_assets::BlockModels::load(&jar, &reports));
     let (tx, rx) = mc_protocol::connect(&addr).with_context(|| format!("connecting to {addr}"))?;
     let models = Arc::new(assets.join().expect("asset thread panicked").context("loading block models")?);
     println!("assets ready after {:?} ({} block states)", started.elapsed(), models.states.len());
@@ -53,8 +56,17 @@ fn run() -> Result<()> {
     let (net_tx, net_rx) = std::sync::mpsc::channel();
     {
         let (tx, block_states) = (tx.clone(), models.states.len());
+        let components = inventory::Components::new(&models.components);
         std::thread::spawn(move || {
-            let opts = Options { addr: &addr, name: &name, greet, block_states: Some(block_states), drives_movement: true, view_distance };
+            let opts = Options {
+                addr: &addr,
+                name: &name,
+                greet,
+                block_states: Some(block_states),
+                drives_movement: true,
+                view_distance,
+                components: Some(&components),
+            };
             match session::run(&opts, tx, rx, |e| {
                 let _ = net_tx.send(e);
             }) {
@@ -69,6 +81,7 @@ fn run() -> Result<()> {
     let vsync = !args.iter().any(|a| a == "--no-vsync");
     let noclip = !args.iter().any(|a| a == "--no-noclip");
     let mut app = app::App::new(started, models, net_rx, tx, vsync, noclip, view_distance);
+    app.join_commands = args.windows(2).filter(|w| w[0] == "--run").map(|w| w[1].clone()).collect();
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -107,7 +120,7 @@ fn headless(args: &[String], addr: &str, name: &str, greet: bool) -> Result<()> 
         });
     }
 
-    let opts = Options { addr, name, greet, block_states: None, drives_movement: false, view_distance: 2 };
+    let opts = Options { addr, name, greet, block_states: None, drives_movement: false, view_distance: 2, components: None };
     let reason = session::run(&opts, tx, rx, |e| match e {
         Event::LoggedIn(n) => println!("logged in as {n}"),
         Event::InWorld => {
@@ -121,6 +134,7 @@ fn headless(args: &[String], addr: &str, name: &str, greet: bool) -> Result<()> 
         Event::Chat(m) => println!("[chat] {m}"),
         Event::Health(h) => println!("health {h:.1}"),
         Event::Forget(..) | Event::Blocks(_) | Event::Light(..) => {}
+        Event::Inventory(_) | Event::InventorySlot(..) | Event::PlayerSlot(..) | Event::HeldSlot(_) => {}
     })?;
     println!("disconnected: {reason}");
     println!("{} chunks received", chunks.load(Relaxed));

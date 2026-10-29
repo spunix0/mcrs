@@ -1,13 +1,15 @@
 ﻿//! wgpu renderer: chunk meshing, GPU buffers, culling, indirect draws. The crate where the performance goal is won.
 
+mod gui;
 mod mesh;
 
+pub use gui::{Gui, GuiTexture, GuiVertex};
 pub use mesh::{Area, ChunkMesh, Vertex, mesh_chunk};
 
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
-use mc_assets::Atlas;
+use mc_assets::{Atlas, GuiAtlas};
 use std::collections::HashMap;
 use wgpu::util::DeviceExt;
 
@@ -20,6 +22,8 @@ struct Uniforms {
     view_proj: [[f32; 4]; 4],
     camera: [f32; 4],
     sky: [f32; 4],
+    /// xy = window size in pixels.
+    screen: [f32; 4],
 }
 
 struct GpuMesh {
@@ -56,6 +60,7 @@ pub struct LineVertex {
 }
 
 const MAX_LINE_VERTICES: u64 = 8192;
+const MAX_GUI_VERTICES: u64 = 65536;
 
 /// Lines drawn after the world: `world` is depth-tested (outlines), `top` is drawn over everything (crosshair).
 #[derive(Default)]
@@ -83,6 +88,9 @@ pub struct Renderer {
     lines_world: wgpu::RenderPipeline,
     lines_top: wgpu::RenderPipeline,
     line_buffer: wgpu::Buffer,
+    gui_pipeline: wgpu::RenderPipeline,
+    gui_bind_group: wgpu::BindGroup,
+    gui_buffer: wgpu::Buffer,
     uniforms: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     chunks: HashMap<(i32, i32), GpuChunk>,
@@ -135,7 +143,7 @@ fn visible(m: &Mat4, min: Vec3, max: Vec3) -> bool {
 }
 
 impl Renderer {
-    pub fn new(target: impl Into<wgpu::SurfaceTarget<'static>>, width: u32, height: u32, atlas: &Atlas, vsync: bool) -> Result<Self> {
+    pub fn new(target: impl Into<wgpu::SurfaceTarget<'static>>, width: u32, height: u32, atlas: &Atlas, gui_atlas: &GuiAtlas, vsync: bool) -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance.create_surface(target)?;
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -307,6 +315,63 @@ impl Renderer {
                 cache: None,
             })
         };
+        let gui_texture = device.create_texture_with_data(
+            &queue,
+            &wgpu::TextureDescriptor {
+                label: Some("gui atlas"),
+                size: wgpu::Extent3d { width: gui_atlas.width, height: gui_atlas.height, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &gui_atlas.rgba,
+        );
+        let gui_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gui"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&gui_texture.create_view(&Default::default())) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
+        });
+        let gui_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<GuiVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Unorm8x4],
+        };
+        let gui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("gui"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_gui"), compilation_options: Default::default(), buffers: &[Some(gui_layout)] },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_gui"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let gui_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gui vertices"),
+            size: MAX_GUI_VERTICES * std::mem::size_of::<GuiVertex>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let lines_world = make_lines("outline", wgpu::CompareFunction::LessEqual);
         let lines_top = make_lines("crosshair", wgpu::CompareFunction::Always);
         let line_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -328,6 +393,9 @@ impl Renderer {
             lines_world,
             lines_top,
             line_buffer,
+            gui_pipeline,
+            gui_bind_group,
+            gui_buffer,
             uniforms,
             bind_group,
             chunks: HashMap::new(),
@@ -373,7 +441,7 @@ impl Renderer {
         }
     }
 
-    pub fn render(&mut self, view_proj: Mat4, camera: Vec3, fog_end: f32, overlay: &Overlay) -> FrameStats {
+    pub fn render(&mut self, view_proj: Mat4, camera: Vec3, fog_end: f32, overlay: &Overlay, gui: &Gui) -> FrameStats {
         let mut stats = FrameStats { drawn: 0, loaded: self.chunks.len(), triangles: 0, gpu_bytes: self.gpu_bytes };
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -388,6 +456,7 @@ impl Renderer {
             view_proj: view_proj.to_cols_array_2d(),
             camera: [camera.x, camera.y, camera.z, fog_end],
             sky: [SKY[0], SKY[1], SKY[2], 1.0],
+            screen: [self.config.width as f32, self.config.height as f32, 0.0, 0.0],
         };
         self.queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
         let mut lines = overlay.world.clone();
@@ -396,6 +465,10 @@ impl Renderer {
         let (world_lines, line_count) = (overlay.world.len().min(lines.len()) as u32, lines.len() as u32);
         if line_count > 0 {
             self.queue.write_buffer(&self.line_buffer, 0, bytemuck::cast_slice(&lines));
+        }
+        let gui_count = gui.vertices.len().min(MAX_GUI_VERTICES as usize);
+        if gui_count > 0 {
+            self.queue.write_buffer(&self.gui_buffer, 0, bytemuck::cast_slice(&gui.vertices[..gui_count]));
         }
 
         let mut visible_chunks: Vec<(&GpuChunk, f32)> = self
@@ -457,6 +530,18 @@ impl Renderer {
                 pass.draw(0..world_lines, 0..1);
                 pass.set_pipeline(&self.lines_top);
                 pass.draw(world_lines..line_count, 0..1);
+            }
+            if gui_count > 0 {
+                pass.set_pipeline(&self.gui_pipeline);
+                pass.set_vertex_buffer(0, self.gui_buffer.slice(..));
+                for &(texture, start, end) in &gui.batches {
+                    let end = end.min(gui_count as u32);
+                    if start >= end {
+                        continue;
+                    }
+                    pass.set_bind_group(0, if texture == GuiTexture::Blocks { &self.bind_group } else { &self.gui_bind_group }, &[]);
+                    pass.draw(start..end, 0..1);
+                }
             }
         }
         self.queue.submit([encoder.finish()]);
