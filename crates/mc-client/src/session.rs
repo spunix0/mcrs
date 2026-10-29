@@ -29,9 +29,17 @@ pub enum Event {
     PlayerSlot(usize, Option<Stack>),
     HeldSlot(u8),
     /// A sound from the server; `at` is `None` for sounds attached to entities we don't track yet.
-    Sound { event: SoundRef, at: Option<[f64; 3]>, volume: f32, pitch: f32 },
+    Sound { event: SoundRef, at: Option<[f64; 3]>, entity: Option<i32>, volume: f32, pitch: f32 },
     /// World events such as 2001 (block broken by someone else, `data` = block state).
     LevelEvent { kind: i32, pos: [i32; 3], data: i32 },
+    EntityAdd { id: i32, kind: u32, pos: [f64; 3], yaw: f32, pitch: f32, head_yaw: f32 },
+    /// Relative moves in 1/4096 blocks; several steps since 26.x.
+    EntityMove { id: i32, steps: Vec<[i16; 3]>, rot: Option<[f32; 2]> },
+    EntityRot { id: i32, rot: [f32; 2] },
+    /// Absolute position (sync or teleport).
+    EntityPos { id: i32, pos: [f64; 3], rot: [f32; 2] },
+    EntityHead { id: i32, yaw: f32 },
+    EntityRemove(Vec<i32>),
     /// Server moved us: feet position and yaw/pitch.
     Teleport([f64; 3], [f32; 2]),
     Chat(String),
@@ -56,6 +64,42 @@ fn sound_ref(r: &mut Reader) -> Result<SoundRef> {
     } else {
         Ok(SoundRef::Id(h as u32 - 1))
     }
+}
+
+/// Angles are sent as 1/256 of a turn.
+fn angle(b: u8) -> f32 {
+    b as i8 as f32 * 360.0 / 256.0
+}
+
+/// `LpVec3`: a compact velocity. Only skipped here; entities don't predict motion yet.
+fn skip_lp_vec3(r: &mut Reader) -> Result<()> {
+    let lowest = r.u8()?;
+    if lowest == 0 {
+        return Ok(());
+    }
+    r.u8()?;
+    r.i32()?;
+    if lowest & 4 != 0 {
+        r.varint()?;
+    }
+    Ok(())
+}
+
+/// `VecDelta`: one (dx, dy, dz) in shorts, or `steps` of (ticks, dx, dy, dz).
+fn vec_delta(r: &mut Reader, steps: usize) -> Result<Vec<[i16; 3]>> {
+    if steps == 0 {
+        return Ok(vec![[r.i16()?, r.i16()?, r.i16()?]]);
+    }
+    (0..steps)
+        .map(|_| {
+            r.varint()?;
+            Ok([r.i16()?, r.i16()?, r.i16()?])
+        })
+        .collect()
+}
+
+fn vec3(r: &mut Reader) -> Result<[f64; 3]> {
+    Ok([r.f64()?, r.f64()?, r.f64()?])
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -329,16 +373,71 @@ pub fn run(opts: &Options, tx: Sender, mut rx: mc_protocol::Receiver, mut emit: 
                     emit(Event::PlayerSlot(index.max(0) as usize, item));
                 }
             }
+            (State::Play, play::s2c::ADD_ENTITY) => {
+                let id = r.varint()?;
+                let _uuid = r.uuid()?;
+                let kind = r.varint()? as u32;
+                let pos = vec3(&mut r)?;
+                skip_lp_vec3(&mut r)?;
+                let (pitch, yaw, head_yaw) = (angle(r.u8()?), angle(r.u8()?), angle(r.u8()?));
+                emit(Event::EntityAdd { id, kind, pos, yaw, pitch, head_yaw });
+            }
+            (State::Play, packet @ (play::s2c::MOVE_ENTITY_POS | play::s2c::MOVE_ENTITY_POS_ROT)) => {
+                let entity = r.varint()?;
+                // Low bit = on ground, the rest = number of steps (0 = a single plain delta).
+                let properties = r.varint()?;
+                let steps = vec_delta(&mut r, (properties >> 1).max(0) as usize)?;
+                let rot = if packet == play::s2c::MOVE_ENTITY_POS_ROT { Some([angle(r.u8()?), angle(r.u8()?)]) } else { None };
+                emit(Event::EntityMove { id: entity, steps, rot });
+            }
+            (State::Play, play::s2c::MOVE_ENTITY_ROT) => {
+                let id = r.varint()?;
+                let _on_ground = r.bool()?;
+                let rot = [angle(r.u8()?), angle(r.u8()?)];
+                emit(Event::EntityRot { id, rot });
+            }
+            (State::Play, play::s2c::ENTITY_POSITION_SYNC) => {
+                let id = r.varint()?;
+                // PositionPath: 0 = one position, 1 = list of (position, tick offset); we keep the end point.
+                let pos = if r.varint()? == 0 {
+                    vec3(&mut r)?
+                } else {
+                    let mut last = [0.0; 3];
+                    for _ in 0..r.len()? {
+                        last = vec3(&mut r)?;
+                        r.varint()?;
+                    }
+                    last
+                };
+                let rot = [r.f32()?, r.f32()?];
+                emit(Event::EntityPos { id, pos, rot });
+            }
+            (State::Play, play::s2c::TELEPORT_ENTITY) => {
+                let id = r.varint()?;
+                let pos = vec3(&mut r)?;
+                let _delta = vec3(&mut r)?;
+                let rot = [r.f32()?, r.f32()?];
+                emit(Event::EntityPos { id, pos, rot });
+            }
+            (State::Play, play::s2c::ROTATE_HEAD) => {
+                let id = r.varint()?;
+                emit(Event::EntityHead { id, yaw: angle(r.u8()?) });
+            }
+            (State::Play, play::s2c::REMOVE_ENTITIES) => {
+                let n = r.len()?;
+                let ids = (0..n).map(|_| r.varint()).collect::<std::io::Result<Vec<_>>>()?;
+                emit(Event::EntityRemove(ids));
+            }
             (State::Play, play::s2c::SOUND) => {
                 let event = sound_ref(&mut r)?;
                 let _source = r.varint()?;
                 let at = [r.i32()? as f64 / 8.0, r.i32()? as f64 / 8.0, r.i32()? as f64 / 8.0];
-                emit(Event::Sound { event, at: Some(at), volume: r.f32()?, pitch: r.f32()? });
+                emit(Event::Sound { event, at: Some(at), entity: None, volume: r.f32()?, pitch: r.f32()? });
             }
             (State::Play, play::s2c::SOUND_ENTITY) => {
                 let event = sound_ref(&mut r)?;
-                let (_source, _entity) = (r.varint()?, r.varint()?);
-                emit(Event::Sound { event, at: None, volume: r.f32()?, pitch: r.f32()? });
+                let (_source, entity) = (r.varint()?, r.varint()?);
+                emit(Event::Sound { event, at: None, entity: Some(entity), volume: r.f32()?, pitch: r.f32()? });
             }
             (State::Play, play::s2c::LEVEL_EVENT) => {
                 let kind = r.i32()?;

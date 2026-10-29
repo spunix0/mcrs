@@ -69,6 +69,8 @@ pub struct Overlay {
     pub top: Vec<LineVertex>,
     /// Blended, depth-tested triangles in world space (block cracks), 3 vertices each.
     pub quads: Vec<Vertex>,
+    /// Entity triangles in world space, textured from the GUI atlas (skins, white for plain boxes).
+    pub entities: Vec<Vertex>,
     /// First-person arm triangles, textured from the GUI atlas (player skin), in world space.
     pub hand_skin: Vec<Vertex>,
     /// First-person held item triangles, textured from the block/item atlas.
@@ -76,6 +78,7 @@ pub struct Overlay {
 }
 
 const MAX_OVERLAY_VERTICES: u64 = 4096;
+const MAX_ENTITY_VERTICES: u64 = 131072;
 
 pub struct FrameStats {
     pub drawn: usize,
@@ -102,6 +105,7 @@ pub struct Renderer {
     overlay_buffer: wgpu::Buffer,
     hand_pipeline: wgpu::RenderPipeline,
     hand_buffer: wgpu::Buffer,
+    entity_buffer: wgpu::Buffer,
     uniforms: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     chunks: HashMap<(i32, i32), GpuChunk>,
@@ -391,6 +395,12 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let entity_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("entities"),
+            size: MAX_ENTITY_VERTICES * std::mem::size_of::<Vertex>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let overlay_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("overlay quads"),
             size: MAX_OVERLAY_VERTICES * std::mem::size_of::<Vertex>() as u64,
@@ -424,6 +434,7 @@ impl Renderer {
             overlay_buffer,
             hand_pipeline,
             hand_buffer,
+            entity_buffer,
             uniforms,
             bind_group,
             chunks: HashMap::new(),
@@ -494,6 +505,10 @@ impl Renderer {
         if line_count > 0 {
             self.queue.write_buffer(&self.line_buffer, 0, bytemuck::cast_slice(&lines));
         }
+        let entity_count = overlay.entities.len().min(MAX_ENTITY_VERTICES as usize) / 3 * 3;
+        if entity_count > 0 {
+            self.queue.write_buffer(&self.entity_buffer, 0, bytemuck::cast_slice(&overlay.entities[..entity_count]));
+        }
         let quad_count = overlay.quads.len().min(MAX_OVERLAY_VERTICES as usize) / 3 * 3;
         if quad_count > 0 {
             self.queue.write_buffer(&self.overlay_buffer, 0, bytemuck::cast_slice(&overlay.quads[..quad_count]));
@@ -554,6 +569,13 @@ impl Renderer {
                     pass.set_index_buffer(m.indices.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..m.count, 0, 0..1);
                 }
+            }
+            if entity_count > 0 {
+                pass.set_pipeline(&self.hand_pipeline);
+                pass.set_bind_group(0, &self.gui_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
+                pass.draw(0..entity_count as u32, 0..1);
+                pass.set_bind_group(0, &self.bind_group, &[]);
             }
             pass.set_pipeline(&self.translucent);
             for (c, _) in visible_chunks.iter().rev() {

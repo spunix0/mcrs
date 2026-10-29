@@ -17,7 +17,7 @@ pub struct Hit {
 }
 
 /// Ray vs. box (slab method): distance and the face entered, if it hits in front of the origin.
-fn hit_box(o: [f64; 3], d: [f64; 3], b: &Aabb) -> Option<(f64, u8)> {
+pub fn hit_box(o: [f64; 3], d: [f64; 3], b: &Aabb) -> Option<(f64, u8)> {
     let (mut t_near, mut t_far, mut face) = (f64::MIN, f64::MAX, 0u8);
     for axis in 0..3 {
         if d[axis].abs() < 1e-12 {

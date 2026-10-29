@@ -123,6 +123,34 @@ pub struct StateModel {
     pub sound: Arc<str>,
 }
 
+/// An entity type: registry name, hitbox and spawn category.
+#[derive(Clone, Debug)]
+pub struct EntityInfo {
+    pub name: String,
+    pub width: f32,
+    pub height: f32,
+    /// `monster`, `creature`, `misc`, ...
+    pub category: String,
+}
+
+fn entity_infos(names: Vec<String>) -> Vec<EntityInfo> {
+    let table: HashMap<&str, (f32, f32, &str)> = include_str!("../data/entity_sizes.tsv")
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            Some((*f.first()?, (f.get(1)?.parse().ok()?, f.get(2)?.parse().ok()?, *f.get(3)?)))
+        })
+        .collect();
+    names
+        .into_iter()
+        .map(|name| {
+            let (width, height, category) = table.get(name.as_str()).copied().unwrap_or((0.6, 1.8, "misc"));
+            EntityInfo { name, width, height, category: category.to_string() }
+        })
+        .collect()
+}
+
 /// The sounds a block makes (vanilla `SoundType`).
 #[derive(Clone, Debug)]
 pub struct SoundSet {
@@ -269,6 +297,8 @@ pub struct BlockModels {
     pub sound_types: HashMap<String, SoundSet>,
     /// Sound event names (e.g. `entity.cow.ambient`) by protocol ID.
     pub sound_events: Vec<String>,
+    /// Entity types by protocol ID.
+    pub entities: Vec<EntityInfo>,
 }
 
 /// `(registry name -> entries in protocol-ID order)` from the server's `reports/registries.json`.
@@ -371,6 +401,7 @@ impl BlockModels {
         let registries: Value = serde_json::from_slice(&fs::read(reports.join("registries.json")).context("reading registries.json")?)?;
         let item_names = load_registry(&registries, "minecraft:item");
         let sound_events = load_registry(&registries, "minecraft:sound_event");
+        let entities = entity_infos(load_registry(&registries, "minecraft:entity_type"));
         let components = load_registry(&registries, "minecraft:data_component_type")
             .into_iter()
             .enumerate()
@@ -448,6 +479,6 @@ impl BlockModels {
                 }
             })
             .collect();
-        Ok(Self { states, atlas, water_uv, lava_uv, crack_uv, items, components, gui, sound_types: sound_types(), sound_events })
+        Ok(Self { states, atlas, water_uv, lava_uv, crack_uv, items, components, gui, sound_types: sound_types(), sound_events, entities })
     }
 }

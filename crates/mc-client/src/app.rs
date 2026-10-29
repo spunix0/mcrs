@@ -1,5 +1,6 @@
 //! The window: fly camera, chunk meshing on worker threads, rendering, and movement packets back to the server.
 
+use crate::entities::{self, Entities};
 use crate::hand;
 use crate::hud::{self, Painter};
 use crate::inventory::Inventory;
@@ -62,6 +63,10 @@ const MINE_COOLDOWN: u8 = 5;
 const USE_COOLDOWN: u8 = 4;
 /// Two jump presses this close together toggle flying, like creative mode.
 const DOUBLE_TAP: Duration = Duration::from_millis(300);
+/// Vanilla survival entity reach.
+const ENTITY_REACH: f64 = 3.0;
+/// Ticks between attacks (about a full-strength fist swing).
+const ATTACK_COOLDOWN: u8 = 10;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Mode {
@@ -158,6 +163,9 @@ pub struct App {
     mine_cooldown: u8,
     use_cooldown: u8,
     target: Option<Hit>,
+    entity_target: Option<i32>,
+    entities: Entities,
+    attack_cooldown: u8,
     inventory_open: bool,
     inventory: Inventory,
     /// Chat lines or commands to send once in the world (`--run`).
@@ -237,6 +245,9 @@ impl App {
             mine_cooldown: 0,
             use_cooldown: 0,
             target: None,
+            entity_target: None,
+            entities: Entities::default(),
+            attack_cooldown: 0,
             inventory_open: false,
             inventory: Inventory::default(),
             join_commands: Vec::new(),
@@ -356,7 +367,8 @@ impl App {
                     self.cam.pitch = rot[1];
                 }
                 Event::Chat(msg) => println!("[chat] {msg}"),
-                Event::Sound { event, at, volume, pitch } => {
+                Event::Sound { event, at, entity, volume, pitch } => {
+                    let at = at.or_else(|| entity.and_then(|id| self.entities.map.get(&id)).map(|e| e.render_pos(Instant::now())));
                     let name = match event {
                         SoundRef::Id(id) => self.models.sound_events.get(id as usize).cloned(),
                         SoundRef::Name(n) => Some(n),
@@ -370,6 +382,16 @@ impl App {
                     self.block_sound(pos, Some(data as u16), |s| &s.break_, |v| (v + 1.0) / 2.0, 0.8);
                 }
                 Event::LevelEvent { .. } => {}
+                Event::EntityAdd { id, kind, pos, yaw, pitch, head_yaw } => self.entities.add(id, kind, pos, yaw, pitch, head_yaw),
+                Event::EntityMove { id, steps, rot } => self.entities.moved(id, &steps, rot),
+                Event::EntityRot { id, rot } => self.entities.rotated(id, rot),
+                Event::EntityPos { id, pos, rot } => self.entities.teleported(id, pos, rot),
+                Event::EntityHead { id, yaw } => self.entities.head(id, yaw),
+                Event::EntityRemove(ids) => {
+                    for id in ids {
+                        self.entities.map.remove(&id);
+                    }
+                }
                 Event::Health(_) => {}
                 Event::Inventory(items) => {
                     for (slot, item) in items.into_iter().enumerate().take(self.inventory.slots.len()) {
@@ -525,6 +547,19 @@ impl App {
         self.use_cooldown = self.use_cooldown.saturating_sub(1);
         let target = self.target.as_ref().map(|t| (t.pos, t.face, t.point));
 
+        self.attack_cooldown = self.attack_cooldown.saturating_sub(1);
+        if let (true, Some(id)) = (mine, self.entity_target) {
+            // Hitting a mob or player instead of mining.
+            if self.attack_cooldown == 0 {
+                let _ = self.tx.send(mc_protocol::ids::play::c2s::ATTACK, &mc_protocol::Writer::new().varint(id).buf);
+                self.attack_cooldown = ATTACK_COOLDOWN;
+            }
+            if let Some(m) = self.mining.take() {
+                let seq = self.next_sequence();
+                let _ = session::send_dig(&self.tx, Dig::Abort, m.pos, m.face, seq);
+            }
+            return;
+        }
         if !mine {
             if let Some(m) = self.mining.take() {
                 let seq = self.next_sequence();
@@ -621,10 +656,33 @@ impl App {
                 Vec::new()
             }
         });
+        // An entity in front of the targeted block (and within attack reach) takes the crosshair.
+        let eye = self.cam.eye;
+        let dir = [look.x as f64, look.y as f64, look.z as f64];
+        let block_dist = self.target.as_ref().map_or(f64::MAX, |t| {
+            let d = [t.point[0] - eye[0], t.point[1] - eye[1], t.point[2] - eye[2]];
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+        });
+        self.entity_target = self
+            .entities
+            .hitboxes(&self.models, Instant::now())
+            .filter_map(|(id, b)| target::hit_box(eye, dir, &b).map(|(t, _)| (id, t)))
+            .filter(|&(_, t)| t <= ENTITY_REACH && t < block_dist)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(id, _)| id);
+    }
+
+    fn light_at(&self, p: [f64; 3]) -> f32 {
+        let (x, y, z) = (p[0].floor() as i32, p[1].floor() as i32, p[2].floor() as i32);
+        self.world.get(&(x.div_euclid(16), z.div_euclid(16))).map_or(1.0, |c| {
+            let (s, b) = c.light(x.rem_euclid(16) as usize, y, z.rem_euclid(16) as usize);
+            0.25 + 0.75 * s.max(b) as f32 / 15.0
+        })
     }
 
     fn overlay(&self, height: u32) -> Overlay {
         let mut o = Overlay::default();
+        o.entities = entities::mesh(&self.entities, &self.models, Instant::now(), |p| self.light_at(p));
         if let Some(t) = &self.target {
             let c = [0, 0, 0, 110];
             for b in &t.boxes {
@@ -732,7 +790,7 @@ impl App {
         };
 
         // Keep swinging while mining or using; finish the current swing when released.
-        let acting = (mine || use_item) && self.target.is_some();
+        let acting = (mine || use_item) && (self.target.is_some() || self.entity_target.is_some());
         if acting || self.swing > 0.0 {
             self.swing += dt / 0.3;
             if self.swing >= 1.0 {

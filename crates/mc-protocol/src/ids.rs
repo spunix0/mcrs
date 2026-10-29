@@ -42,6 +42,7 @@ pub mod config {
 pub mod play {
     pub mod c2s {
         pub const ACCEPT_TELEPORTATION: i32 = 0;
+        pub const ATTACK: i32 = 1;
         pub const CHAT_COMMAND: i32 = 7;
         pub const CHAT: i32 = 9;
         pub const CHUNK_BATCH_RECEIVED: i32 = 11;
@@ -59,6 +60,14 @@ pub mod play {
         pub const USE_ITEM: i32 = 67;
     }
     pub mod s2c {
+        pub const ADD_ENTITY: i32 = 1;
+        pub const ENTITY_POSITION_SYNC: i32 = 35;
+        pub const MOVE_ENTITY_POS: i32 = 54;
+        pub const MOVE_ENTITY_POS_ROT: i32 = 55;
+        pub const MOVE_ENTITY_ROT: i32 = 57;
+        pub const REMOVE_ENTITIES: i32 = 78;
+        pub const ROTATE_HEAD: i32 = 85;
+        pub const TELEPORT_ENTITY: i32 = 128;
         pub const BLOCK_UPDATE: i32 = 8;
         pub const CONTAINER_SET_CONTENT: i32 = 18;
         pub const CONTAINER_SET_SLOT: i32 = 20;

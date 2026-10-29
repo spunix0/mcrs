@@ -6,6 +6,7 @@
 //! `--headless [--say "hi"] [--for 30] [--greet]` runs without a window; stdin lines are sent as chat.
 
 mod app;
+mod entities;
 mod hand;
 mod audio;
 mod hud;
@@ -139,6 +140,8 @@ fn headless(args: &[String], addr: &str, name: &str, greet: bool) -> Result<()> 
         Event::Forget(..) | Event::Blocks(_) | Event::Light(..) => {}
         Event::Inventory(_) | Event::InventorySlot(..) | Event::PlayerSlot(..) | Event::HeldSlot(_) => {}
         Event::Sound { .. } | Event::LevelEvent { .. } => {}
+        Event::EntityAdd { .. } | Event::EntityMove { .. } | Event::EntityRot { .. } | Event::EntityPos { .. } => {}
+        Event::EntityHead { .. } | Event::EntityRemove(_) => {}
     })?;
     println!("disconnected: {reason}");
     println!("{} chunks received", chunks.load(Relaxed));
