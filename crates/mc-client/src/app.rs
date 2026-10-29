@@ -1,5 +1,6 @@
 //! The window: fly camera, chunk meshing on worker threads, rendering, and movement packets back to the server.
 
+use crate::physics::{self, Aabb, Body, Input};
 use crate::session::{self, Event};
 use gilrs::{Axis, Button, Gilrs};
 use glam::{Mat4, Vec3};
@@ -17,11 +18,15 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
 const EYE_HEIGHT: f64 = 1.62;
+const SNEAK_EYE_HEIGHT: f64 = 1.27;
+/// One game tick.
+const TICK: f32 = 0.05;
 const STICK_DEADZONE: f32 = 0.15;
 /// Degrees per second at full right-stick deflection.
 const PAD_LOOK_SPEED: f32 = 220.0;
 
-/// Gamepad state for one frame. A rises, clicking the right stick lowers, clicking the left stick sprints.
+/// Gamepad state for one frame. A jumps/rises, clicking the right stick sneaks/lowers,
+/// clicking the left stick sprints, Y toggles walk/fly.
 #[derive(Default)]
 struct Pad {
     left: [f32; 2],
@@ -29,6 +34,50 @@ struct Pad {
     sprint: bool,
     rise: bool,
     lower: bool,
+    toggle: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Mode {
+    /// Survival with vanilla physics.
+    Walk,
+    /// Spectator noclip camera.
+    Fly,
+}
+
+/// Block collision, friction and water lookups for the physics, from the loaded chunks.
+struct WorldView<'a> {
+    chunks: &'a HashMap<(i32, i32), Arc<Chunk>>,
+    models: &'a BlockModels,
+}
+
+impl WorldView<'_> {
+    fn state(&self, x: i32, y: i32, z: i32) -> Option<&mc_assets::StateModel> {
+        let c = self.chunks.get(&(x.div_euclid(16), z.div_euclid(16)))?;
+        self.models.states.get(c.get(x.rem_euclid(16) as usize, y, z.rem_euclid(16) as usize) as usize)
+    }
+}
+
+impl physics::World for WorldView<'_> {
+    fn boxes(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) {
+        let (fx, fy, fz) = (x as f64, y as f64, z as f64);
+        match self.state(x, y, z) {
+            Some(s) => out.extend(s.collision.iter().map(|b| Aabb {
+                min: [fx + b[0] as f64, fy + b[1] as f64, fz + b[2] as f64],
+                max: [fx + b[3] as f64, fy + b[4] as f64, fz + b[5] as f64],
+            })),
+            // Not loaded yet: solid, so you don't fall out of the world while chunks stream in.
+            None => out.push(Aabb { min: [fx, fy, fz], max: [fx + 1.0, fy + 1.0, fz + 1.0] }),
+        }
+    }
+
+    fn friction(&self, x: i32, y: i32, z: i32) -> f32 {
+        self.state(x, y, z).map_or(0.6, |s| s.friction)
+    }
+
+    fn water(&self, x: i32, y: i32, z: i32) -> bool {
+        self.state(x, y, z).is_some_and(|s| s.fluid == Some(mc_assets::Fluid::Water))
+    }
 }
 
 struct Camera {
@@ -68,7 +117,12 @@ pub struct App {
     gilrs: Option<Gilrs>,
     grabbed: bool,
     in_world: bool,
-    last_send: Instant,
+    focused: bool,
+    mode: Mode,
+    body: Body,
+    prev_feet: [f64; 3],
+    tick_time: f32,
+    pad_toggle_held: bool,
     last_frame: Instant,
     frames: u32,
     fps_since: Instant,
@@ -118,7 +172,12 @@ impl App {
                 .inspect(|g| g.gamepads().for_each(|(_, p)| println!("controller found: {}", p.name()))),
             grabbed: false,
             in_world: false,
-            last_send: Instant::now(),
+            focused: true,
+            mode: Mode::Walk,
+            body: Body::new([0.0, 80.0, 0.0]),
+            prev_feet: [0.0, 80.0, 0.0],
+            tick_time: 0.0,
+            pad_toggle_held: false,
             last_frame: Instant::now(),
             frames: 0,
             fps_since: Instant::now(),
@@ -174,11 +233,7 @@ impl App {
                 Event::InWorld => {
                     self.in_world = true;
                     self.status = "in world".into();
-                    // Spectators are the only players the server lets fly through blocks.
-                    // Needs operator rights; without them the server just replies with an error message.
-                    if self.noclip {
-                        let _ = session::send_chat(&self.tx, "/gamemode spectator");
-                    }
+                    self.request_gamemode();
                 }
                 Event::Chunk(c) => {
                     let key = (c.x, c.z);
@@ -219,6 +274,8 @@ impl App {
                 }
                 Event::Teleport(feet, rot) => {
                     self.cam.eye = [feet[0], feet[1] + EYE_HEIGHT, feet[2]];
+                    self.body = Body::new(feet);
+                    self.prev_feet = feet;
                     self.cam.yaw = rot[0];
                     self.cam.pitch = rot[1];
                 }
@@ -250,6 +307,10 @@ impl App {
                 _ => {}
             }
         }
+        // Gamepads are global; a window in the background shouldn't move.
+        if !self.focused {
+            return Pad::default();
+        }
         let Some((_, pad)) = g.gamepads().find(|(_, p)| p.is_connected()) else { return Pad::default() };
         let stick = |x: Axis, y: Axis| {
             let v = [pad.value(x), pad.value(y)];
@@ -267,11 +328,43 @@ impl App {
             sprint: pad.is_pressed(Button::LeftThumb),
             rise: pad.is_pressed(Button::South),
             lower: pad.is_pressed(Button::RightThumb),
+            toggle: pad.is_pressed(Button::North),
         }
     }
 
+    /// Switches walking (survival, physics) and flying (spectator, noclip).
+    fn toggle_mode(&mut self) {
+        self.mode = match self.mode {
+            Mode::Walk => Mode::Fly,
+            Mode::Fly => {
+                self.body = Body::new(self.feet());
+                self.prev_feet = self.body.pos;
+                Mode::Walk
+            }
+        };
+        self.request_gamemode();
+    }
+
+    fn request_gamemode(&self) {
+        // Only spectators may pass through blocks; needs operator rights (else the server just says no).
+        if self.noclip && self.in_world {
+            let cmd = if self.mode == Mode::Fly { "/gamemode spectator" } else { "/gamemode survival" };
+            let _ = session::send_chat(&self.tx, cmd);
+        }
+    }
+
+    fn feet(&self) -> [f64; 3] {
+        let [x, y, z] = self.cam.eye;
+        [x, y - EYE_HEIGHT, z]
+    }
+
     fn update(&mut self, dt: f32) {
-        let Pad { left, right: right_stick, sprint: pad_sprint, rise, lower } = self.pad();
+        let pad = self.pad();
+        if pad.toggle && !self.pad_toggle_held {
+            self.toggle_mode();
+        }
+        self.pad_toggle_held = pad.toggle;
+        let Pad { left, right: right_stick, sprint: pad_sprint, rise, lower, .. } = pad;
         // Squared response gives fine control near the center and full speed at the edge.
         let curve = |v: f32| v * v.abs();
         self.cam.yaw += curve(right_stick[0]) * PAD_LOOK_SPEED * dt;
@@ -279,6 +372,46 @@ impl App {
 
         let held = |k| self.keys.contains(&k);
         let sprint = held(KeyCode::ControlLeft) || pad_sprint;
+        let axis = |pos: KeyCode, neg: KeyCode, stick: f32| ((held(pos) as i32 - held(neg) as i32) as f32 + stick).clamp(-1.0, 1.0);
+        let input = Input {
+            forward: axis(KeyCode::KeyW, KeyCode::KeyS, left[1]),
+            strafe: axis(KeyCode::KeyA, KeyCode::KeyD, -left[0]),
+            jump: held(KeyCode::Space) || rise,
+            sprint,
+            sneak: held(KeyCode::ShiftLeft) || lower,
+        };
+
+        if self.mode == Mode::Walk {
+            self.walk(&input, dt);
+        } else {
+            self.fly(dt, sprint, left, rise, lower);
+        }
+    }
+
+    /// Fixed 20 Hz physics ticks, each followed by one movement packet, with the camera interpolated in between.
+    fn walk(&mut self, input: &Input, dt: f32) {
+        if !self.in_world {
+            return;
+        }
+        self.tick_time = (self.tick_time + dt).min(0.25);
+        while self.tick_time >= TICK {
+            self.tick_time -= TICK;
+            self.prev_feet = self.body.pos;
+            let world = WorldView { chunks: &self.world, models: &self.models };
+            self.body.tick(input, self.cam.yaw, &world);
+            let flags = self.body.on_ground as u8 | (self.body.horizontal_collision as u8) << 1;
+            let _ = session::send_tick(&self.tx, self.body.pos, [self.cam.yaw, self.cam.pitch], flags);
+        }
+        let t = (self.tick_time / TICK) as f64;
+        let eye = if input.sneak { SNEAK_EYE_HEIGHT } else { EYE_HEIGHT };
+        for i in 0..3 {
+            self.cam.eye[i] = self.prev_feet[i] + (self.body.pos[i] - self.prev_feet[i]) * t;
+        }
+        self.cam.eye[1] += eye;
+    }
+
+    fn fly(&mut self, dt: f32, sprint: bool, left: [f32; 2], rise: bool, lower: bool) {
+        let held = |k| self.keys.contains(&k);
         let speed = if sprint { 30.0 } else { 10.0 } * dt as f64;
         let y = self.cam.yaw.to_radians() as f64;
         let forward = [-y.sin(), 0.0, y.cos()];
@@ -301,10 +434,10 @@ impl App {
                 self.cam.eye[i] += mv[i] * scale;
             }
         }
-        if self.in_world && self.last_send.elapsed() >= Duration::from_millis(50) {
-            self.last_send = Instant::now();
-            let [x, y, z] = self.cam.eye;
-            let _ = session::send_tick(&self.tx, [x, y - EYE_HEIGHT, z], [self.cam.yaw, self.cam.pitch]);
+        self.tick_time = (self.tick_time + dt).min(0.25);
+        while self.in_world && self.tick_time >= TICK {
+            self.tick_time -= TICK;
+            let _ = session::send_tick(&self.tx, self.feet(), [self.cam.yaw, self.cam.pitch], 0);
         }
     }
 
@@ -333,11 +466,12 @@ impl App {
             if let Some(w) = &self.window {
                 let [x, y, z] = self.cam.eye;
                 w.set_title(&format!(
-                    "mcrs · Rust Edition  |  {fps:.0} fps  |  {}/{} chunks  |  {:.1}M tris  |  {} MB GPU  |  {x:.0} {y:.0} {z:.0}  |  {}",
+                    "mcrs · Rust Edition  |  {fps:.0} fps  |  {}/{} chunks  |  {:.1}M tris  |  {} MB GPU  |  {x:.0} {y:.0} {z:.0}  |  {:?}  |  {}",
                     stats.drawn,
                     stats.loaded,
                     stats.triangles as f64 / 1e6,
                     stats.gpu_bytes / 1_048_576,
+                    self.mode,
                     self.status
                 ));
             }
@@ -375,9 +509,11 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::Focused(false) => {
+                self.focused = false;
                 self.keys.clear();
                 self.set_grab(false);
             }
+            WindowEvent::Focused(true) => self.focused = true,
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } if !self.grabbed => self.set_grab(true),
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
@@ -385,6 +521,9 @@ impl ApplicationHandler for App {
                         ElementState::Pressed => {
                             if code == KeyCode::Escape {
                                 self.set_grab(false);
+                            }
+                            if code == KeyCode::KeyF && !event.repeat {
+                                self.toggle_mode();
                             }
                             self.keys.insert(code);
                         }

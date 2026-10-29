@@ -5,6 +5,7 @@
 //! `--headless [--say "hi"] [--for 30] [--greet]` runs without a window; stdin lines are sent as chat.
 
 mod app;
+mod physics;
 mod session;
 
 use anyhow::{Context, Result};

@@ -117,6 +117,9 @@ pub struct BakedPart {
     pub full_cube: bool,
     /// Textures of that full-cube element, used to decide whether it hides neighbors.
     pub textures: Vec<String>,
+    /// Element boxes after blockstate rotation, in block units: `[min x, y, z, max x, y, z]`.
+    /// Rotated elements (plants, wall torches) and zero-thickness planes are left out; they don't collide.
+    pub boxes: Vec<[f32; 6]>,
 }
 
 pub struct Baker {
@@ -135,6 +138,31 @@ fn rotate(p: [f32; 3], axis: char, deg: f32, origin: [f32; 3]) -> [f32; 3] {
         _ => [x * c - y * s, x * s + y * c, z],
     };
     [r[0] + origin[0], r[1] + origin[1], r[2] + origin[2]]
+}
+
+/// Applies the blockstate's 90° X/Y rotation to an element box and returns it in block units.
+fn rotated_box(from: [f32; 3], to: [f32; 3], v: &VariantRef) -> [f32; 6] {
+    let mut lo = [f32::MAX; 3];
+    let mut hi = [f32::MIN; 3];
+    for corner in 0..8 {
+        let mut p = [
+            if corner & 1 == 0 { from[0] } else { to[0] },
+            if corner & 2 == 0 { from[1] } else { to[1] },
+            if corner & 4 == 0 { from[2] } else { to[2] },
+        ];
+        for (axis, deg) in [('x', -(v.x as f32)), ('y', -(v.y as f32))] {
+            if deg != 0.0 {
+                p = rotate(p, axis, deg, [8.0; 3]);
+            }
+        }
+        for i in 0..3 {
+            // Round away float noise from the 90° rotations.
+            let c = (p[i] * 1000.0).round() / 16000.0;
+            lo[i] = lo[i].min(c);
+            hi[i] = hi[i].max(c);
+        }
+    }
+    [lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]]
 }
 
 fn vec3(v: &Value) -> Option<[f32; 3]> {
@@ -237,7 +265,7 @@ impl Baker {
         if let Some(b) = self.baked.get(v) {
             return b.clone();
         }
-        let mut part = BakedPart { quads: Vec::new(), full_cube: false, textures: Vec::new() };
+        let mut part = BakedPart { quads: Vec::new(), full_cube: false, textures: Vec::new(), boxes: Vec::new() };
         if let Some(model) = self.resolve(jar, &v.model) {
             for el in &model.elements {
                 let (Some(from), Some(to)) = (vec3(&el["from"]), vec3(&el["to"])) else { continue };
@@ -298,6 +326,11 @@ impl Baker {
                     part.quads.push(PendingQuad { pos, uv, texture, cull, shade, tinted: face.get("tintindex").is_some() });
                 }
                 part.full_cube |= is_full;
+                let tilted = rot.is_some_and(|r| r["angle"].as_f64().unwrap_or(0.0) != 0.0);
+                let flat = (0..3).any(|i| (to[i] - from[i]).abs() < 0.01);
+                if !tilted && !flat {
+                    part.boxes.push(rotated_box(from, to, v));
+                }
             }
         }
         let part = Arc::new(part);

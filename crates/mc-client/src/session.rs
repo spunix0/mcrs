@@ -60,9 +60,10 @@ pub fn send_chat(tx: &Sender, line: &str) -> Result<()> {
 }
 
 /// One client tick's movement. The server allows a single position per tick, and a tick ends with `client_tick_end`.
-pub fn send_tick(tx: &Sender, pos: [f64; 3], rot: [f32; 2]) -> Result<()> {
+/// `flags`: bit 0 = on ground, bit 1 = horizontal collision.
+pub fn send_tick(tx: &Sender, pos: [f64; 3], rot: [f32; 2], flags: u8) -> Result<()> {
     let [x, y, z] = pos;
-    tx.send(play::c2s::MOVE_PLAYER_POS_ROT, &Writer::new().f64(x).f64(y).f64(z).f32(rot[0]).f32(rot[1]).u8(0).buf)?;
+    tx.send(play::c2s::MOVE_PLAYER_POS_ROT, &Writer::new().f64(x).f64(y).f64(z).f32(rot[0]).f32(rot[1]).u8(flags).buf)?;
     tx.send(play::c2s::CLIENT_TICK_END, &[])?;
     Ok(())
 }
@@ -172,7 +173,7 @@ pub fn run(opts: &Options, tx: Sender, mut rx: mc_protocol::Receiver, mut emit: 
                 tx.send(play::c2s::ACCEPT_TELEPORTATION, &Writer::new().varint(teleport).f64(x).f64(y).f64(z).f32(rot[0]).f32(rot[1]).buf)?;
                 // With a window, the render loop owns movement packets; sending here too could put two in one tick.
                 if !opts.drives_movement {
-                    send_tick(&tx, pos, rot)?;
+                    send_tick(&tx, pos, rot, 0)?;
                 }
                 emit(Event::Teleport(pos, rot));
             }

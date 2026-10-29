@@ -8,11 +8,11 @@ fn main() -> anyhow::Result<()> {
     let t = Instant::now();
     let m = mc_assets::BlockModels::load(&data.join("versions/26.3/26.3.jar"), &data.join("reports/blocks.json"))?;
     println!("baked {} states in {:?}; atlas {}x{} with {} textures", m.states.len(), t.elapsed(), m.atlas.width, m.atlas.height, m.atlas.len());
-    for (name, id) in [("air", 0), ("stone", 1), ("grass_block", 9), ("oak_log y", 140), ("water", 86)] {
-        let s = &m.states[id];
-        println!("  {name:12} quads={:2} opaque={} fluid={:?}", s.quads.len(), s.opaque, s.fluid);
+    let blocks: serde_json::Value = serde_json::from_slice(&std::fs::read(data.join("reports/blocks.json"))?)?;
+    let first = |name: &str| blocks[format!("minecraft:{name}")]["states"][0]["id"].as_u64().unwrap() as usize;
+    for name in ["air", "stone", "grass_block", "oak_slab", "oak_stairs", "oak_fence", "short_grass", "torch", "water", "ice"] {
+        let s = &m.states[first(name)];
+        println!("  {name:12} quads={:2} opaque={:5} fluid={:?} friction={} collision={:?}", s.quads.len(), s.opaque, s.fluid, s.friction, s.collision);
     }
-    let empty = m.states.iter().filter(|s| s.quads.is_empty() && s.fluid.is_none()).count();
-    println!("  states with no geometry (air, entity-rendered blocks): {empty}");
     Ok(())
 }

@@ -102,6 +102,43 @@ pub struct StateModel {
     pub opaque: bool,
     pub fluid: Option<Fluid>,
     pub tint: [u8; 3],
+    /// Collision boxes in block units (`[min x, y, z, max x, y, z]`). Approximated from model elements, since
+    /// vanilla defines shapes in code; see [`collision_for`].
+    pub collision: Arc<Vec<[f32; 6]>>,
+    /// Ground slipperiness (0.6 for most blocks).
+    pub friction: f32,
+}
+
+/// Blocks you can walk through even though their model has solid-looking boxes.
+const NO_COLLISION: &[&str] = &[
+    "torch", "sign", "banner", "button", "pressure_plate", "lever", "fire", "tripwire", "portal", "light", "structure_void", "powder_snow",
+];
+
+fn collision_for(block: &str, boxes: Vec<[f32; 6]>) -> Vec<[f32; 6]> {
+    if NO_COLLISION.iter().any(|n| block.contains(n)) {
+        return Vec::new();
+    }
+    // Fences and walls (posts and arms alike) collide as 1.5-block-tall columns so you can't jump them.
+    let tall = block.ends_with("_fence") || block.ends_with("_wall");
+    boxes
+        .into_iter()
+        .map(|mut b| {
+            if tall {
+                b[1] = 0.0;
+                b[4] = 1.5;
+            }
+            b
+        })
+        .collect()
+}
+
+fn friction_for(block: &str) -> f32 {
+    match block {
+        "ice" | "packed_ice" | "frosted_ice" => 0.98,
+        "blue_ice" => 0.989,
+        "slime_block" => 0.8,
+        _ => 0.6,
+    }
 }
 
 pub struct BlockModels {
@@ -206,9 +243,11 @@ impl BlockModels {
             .zip(resolved)
             .map(|(s, parts)| {
                 let mut quads = Vec::new();
+                let mut boxes = Vec::new();
                 let mut opaque = false;
                 for p in &parts {
                     quads.extend(p.quads.iter().map(|q| q.finish(&atlas)));
+                    boxes.extend_from_slice(&p.boxes);
                     opaque |= p.full_cube && !p.textures.iter().any(|t| atlas.has_alpha(t));
                 }
                 let is_air = matches!(s.block.as_str(), "air" | "cave_air" | "void_air");
@@ -224,6 +263,8 @@ impl BlockModels {
                     opaque: opaque && !is_air,
                     fluid,
                     tint: tint_for(&s.block),
+                    collision: Arc::new(if is_air { Vec::new() } else { collision_for(&s.block, boxes) }),
+                    friction: friction_for(&s.block),
                 }
             })
             .collect();
