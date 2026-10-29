@@ -29,6 +29,13 @@ const SPRITES: &[(&str, &str, u32, u32)] = &[
     ("crosshair", "gui/sprites/hud/crosshair.png", 0, 0),
     ("inventory", "gui/container/inventory.png", 176, 166),
     ("font", "font/ascii.png", 0, 0),
+    ("steve", "entity/player/wide/steve.png", 0, 0),
+    ("heart_container", "gui/sprites/hud/heart/container.png", 0, 0),
+    ("heart_full", "gui/sprites/hud/heart/full.png", 0, 0),
+    ("heart_half", "gui/sprites/hud/heart/half.png", 0, 0),
+    ("food_empty", "gui/sprites/hud/food_empty.png", 0, 0),
+    ("food_full", "gui/sprites/hud/food_full.png", 0, 0),
+    ("food_half", "gui/sprites/hud/food_half.png", 0, 0),
 ];
 
 const SIZE: u32 = 512;

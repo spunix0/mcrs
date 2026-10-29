@@ -249,6 +249,8 @@ pub struct ItemInfo {
     /// Grass/foliage tint for icons whose texture is grayscale (leaves, grass, vines).
     pub tint: Option<[u8; 3]>,
     pub tool: Option<Tool>,
+    /// Drawn as a small cube in hand (block items) rather than a flat sprite.
+    pub block: bool,
 }
 
 pub struct BlockModels {
@@ -389,12 +391,18 @@ impl BlockModels {
             let baked: Vec<_> = parts.iter().map(|p| baker.bake(&mut jar, p)).collect();
             resolved.push(baked);
         }
-        let icon_textures: Vec<Option<String>> = item_names.iter().map(|n| baker.item_icon(&mut jar, n)).collect();
+        let icon_textures: Vec<Option<(String, bool)>> = item_names.iter().map(|n| baker.item_icon(&mut jar, n)).collect();
         let atlas = baker.stitch(&mut jar)?;
         let items = item_names
             .iter()
             .zip(icon_textures)
-            .map(|(name, tex)| ItemInfo { name: name.clone(), icon: tex.map(|t| atlas.rect(&t)), tint: item_tint(name), tool: tool_for_item(name) })
+            .map(|(name, tex)| ItemInfo {
+                name: name.clone(),
+                icon: tex.as_ref().map(|t| atlas.rect(&t.0)),
+                block: tex.is_some_and(|t| t.1),
+                tint: item_tint(name),
+                tool: tool_for_item(name),
+            })
             .collect();
         let gui = GuiAtlas::load(&mut jar)?;
         let water_uv = atlas.rect("minecraft:block/water_still");

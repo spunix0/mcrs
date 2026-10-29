@@ -6,6 +6,7 @@
 //! `--headless [--say "hi"] [--for 30] [--greet]` runs without a window; stdin lines are sent as chat.
 
 mod app;
+mod hand;
 mod audio;
 mod hud;
 mod inventory;

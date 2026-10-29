@@ -340,7 +340,8 @@ impl Baker {
 
     /// Picks a flat icon texture for an item: `layer0` for drawn items, a representative face for block items.
     /// Registers the texture so it lands in the atlas.
-    pub fn item_icon(&mut self, jar: &mut Jar, item: &str) -> Option<String> {
+    /// Returns the texture and whether the item is drawn as a block.
+    pub fn item_icon(&mut self, jar: &mut Jar, item: &str) -> Option<(String, bool)> {
         fn first_model(v: &Value) -> Option<String> {
             match v {
                 Value::Object(o) => {
@@ -359,7 +360,7 @@ impl Baker {
         let key = ["layer0", "all", "side", "front", "north", "texture", "top", "particle"]
             .into_iter()
             .find(|k| model.textures.contains_key(*k))?;
-        Some(self.texture(&model, &format!("#{key}")))
+        Some((self.texture(&model, &format!("#{key}")), model_name.contains("block/")))
     }
 
     /// Loads every referenced texture (plus fluids) and packs the atlas.

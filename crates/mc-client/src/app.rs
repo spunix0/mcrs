@@ -1,5 +1,6 @@
 //! The window: fly camera, chunk meshing on worker threads, rendering, and movement packets back to the server.
 
+use crate::hand;
 use crate::hud::{self, Painter};
 use crate::inventory::Inventory;
 use crate::physics::{self, Aabb, Body, Input};
@@ -168,6 +169,8 @@ pub struct App {
     /// Vanilla's `moveDist` / `nextStep` for footstep sounds.
     walked: f64,
     next_step: f64,
+    /// Arm swing progress 0..1 (vanilla swings take 6 ticks).
+    swing: f32,
     /// Cursor position in window pixels (for menus).
     mouse_pos: (f32, f32),
     last_frame: Instant,
@@ -241,6 +244,7 @@ impl App {
             pending_place: None,
             walked: 0.0,
             next_step: 1.0,
+            swing: 0.0,
             mouse_pos: (0.0, 0.0),
             last_frame: Instant::now(),
             frames: 0,
@@ -670,6 +674,19 @@ impl App {
                 o.top.push(LineVertex { pos: a.into(), color: c });
                 o.top.push(LineVertex { pos: b.into(), color: c });
             }
+
+            let [ex, ey, ez] = self.cam.eye;
+            let (cx, cz) = ((ex.floor() as i32).div_euclid(16), (ez.floor() as i32).div_euclid(16));
+            let light = self.world.get(&(cx, cz)).map_or(1.0, |c| {
+                let (s, b) = c.light((ex.floor() as i32).rem_euclid(16) as usize, ey.floor() as i32, (ez.floor() as i32).rem_euclid(16) as usize);
+                0.25 + 0.75 * s.max(b) as f32 / 15.0
+            });
+            let pose = hand::Pose { eye, look, swing: self.swing, walked: self.walked as f32, light };
+            let held = self.inventory.hotbar(self.slot as usize).and_then(|s| self.models.items.get(s.item as usize));
+            match held {
+                Some(item) if item.icon.is_some() => hand::item(&mut o.hand_item, &pose, item),
+                _ => hand::arm(&mut o.hand_skin, &pose, &self.models.gui.sprite("steve")),
+            }
         }
         o
     }
@@ -714,6 +731,14 @@ impl App {
             sneak: held(KeyCode::ShiftLeft) || lower,
         };
 
+        // Keep swinging while mining or using; finish the current swing when released.
+        let acting = (mine || use_item) && self.target.is_some();
+        if acting || self.swing > 0.0 {
+            self.swing += dt / 0.3;
+            if self.swing >= 1.0 {
+                self.swing = if acting { self.swing - 1.0 } else { 0.0 };
+            }
+        }
         if self.mode == Mode::Walk {
             self.walk(&input, mine, use_item, dt);
         } else {

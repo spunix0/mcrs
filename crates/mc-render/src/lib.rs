@@ -69,6 +69,10 @@ pub struct Overlay {
     pub top: Vec<LineVertex>,
     /// Blended, depth-tested triangles in world space (block cracks), 3 vertices each.
     pub quads: Vec<Vertex>,
+    /// First-person arm triangles, textured from the GUI atlas (player skin), in world space.
+    pub hand_skin: Vec<Vertex>,
+    /// First-person held item triangles, textured from the block/item atlas.
+    pub hand_item: Vec<Vertex>,
 }
 
 const MAX_OVERLAY_VERTICES: u64 = 4096;
@@ -96,6 +100,8 @@ pub struct Renderer {
     gui_bind_group: wgpu::BindGroup,
     gui_buffer: wgpu::Buffer,
     overlay_buffer: wgpu::Buffer,
+    hand_pipeline: wgpu::RenderPipeline,
+    hand_buffer: wgpu::Buffer,
     uniforms: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     chunks: HashMap<(i32, i32), GpuChunk>,
@@ -377,6 +383,14 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // The hand is drawn like opaque blocks (alpha-tested), both sides, in its own depth buffer.
+        let hand_pipeline = make("fs_opaque", None, true, None);
+        let hand_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hand"),
+            size: MAX_OVERLAY_VERTICES * std::mem::size_of::<Vertex>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let overlay_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("overlay quads"),
             size: MAX_OVERLAY_VERTICES * std::mem::size_of::<Vertex>() as u64,
@@ -408,6 +422,8 @@ impl Renderer {
             gui_bind_group,
             gui_buffer,
             overlay_buffer,
+            hand_pipeline,
+            hand_buffer,
             uniforms,
             bind_group,
             chunks: HashMap::new(),
@@ -482,6 +498,13 @@ impl Renderer {
         if quad_count > 0 {
             self.queue.write_buffer(&self.overlay_buffer, 0, bytemuck::cast_slice(&overlay.quads[..quad_count]));
         }
+        let mut hand = overlay.hand_skin.clone();
+        hand.extend_from_slice(&overlay.hand_item);
+        hand.truncate(MAX_OVERLAY_VERTICES as usize);
+        let (skin_count, hand_count) = (overlay.hand_skin.len().min(hand.len()) as u32, hand.len() as u32);
+        if hand_count > 0 {
+            self.queue.write_buffer(&self.hand_buffer, 0, bytemuck::cast_slice(&hand));
+        }
         let gui_count = gui.vertices.len().min(MAX_GUI_VERTICES as usize);
         if gui_count > 0 {
             self.queue.write_buffer(&self.gui_buffer, 0, bytemuck::cast_slice(&gui.vertices[..gui_count]));
@@ -551,6 +574,38 @@ impl Renderer {
                 pass.draw(0..world_lines, 0..1);
                 pass.set_pipeline(&self.lines_top);
                 pass.draw(world_lines..line_count, 0..1);
+            }
+        }
+        {
+            // First-person hand and held item, then the GUI: a fresh depth buffer so the hand never clips into walls.
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("hand and gui"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
+                    stencil_ops: None,
+                }),
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+            if hand_count > 0 {
+                pass.set_pipeline(&self.hand_pipeline);
+                pass.set_vertex_buffer(0, self.hand_buffer.slice(..));
+                if skin_count > 0 {
+                    pass.set_bind_group(0, &self.gui_bind_group, &[]);
+                    pass.draw(0..skin_count, 0..1);
+                }
+                if hand_count > skin_count {
+                    pass.set_bind_group(0, &self.bind_group, &[]);
+                    pass.draw(skin_count..hand_count, 0..1);
+                }
             }
             if gui_count > 0 {
                 pass.set_pipeline(&self.gui_pipeline);
