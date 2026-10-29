@@ -107,6 +107,37 @@ pub struct StateModel {
     pub collision: Arc<Vec<[f32; 6]>>,
     /// Ground slipperiness (0.6 for most blocks).
     pub friction: f32,
+    /// Mining hardness (vanilla `destroyTime`); negative means unbreakable.
+    pub hardness: f32,
+    /// Drops only with the right tool; bare hands then mine 3.3x slower.
+    pub needs_tool: bool,
+}
+
+/// `block -> (hardness, needs correct tool)`, extracted from 26.3's Blocks.java by `tools/hardness.pl`.
+fn hardness_table() -> HashMap<&'static str, (f32, bool)> {
+    include_str!("../data/hardness.tsv")
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| {
+            let mut f = l.split('\t');
+            Some((f.next()?, (f.next()?.parse().ok()?, f.next()? == "1")))
+        })
+        .collect()
+}
+
+impl StateModel {
+    /// Ticks to mine with an empty hand (vanilla `getDestroyProgress`), or `None` if it can't be mined.
+    pub fn break_ticks(&self, on_ground: bool) -> Option<u32> {
+        if self.hardness < 0.0 {
+            return None;
+        }
+        if self.hardness == 0.0 {
+            return Some(0);
+        }
+        let speed = if on_ground { 1.0 } else { 0.2 };
+        let per_tick = speed / self.hardness / if self.needs_tool { 100.0 } else { 30.0 };
+        Some((1.0 / per_tick).ceil() as u32)
+    }
 }
 
 /// Blocks you can walk through even though their model has solid-looking boxes.
@@ -238,6 +269,7 @@ impl BlockModels {
         let water_uv = atlas.rect("minecraft:block/water_still");
         let lava_uv = atlas.rect("minecraft:block/lava_still");
 
+        let hardness = hardness_table();
         let states = states
             .iter()
             .zip(resolved)
@@ -265,6 +297,8 @@ impl BlockModels {
                     tint: tint_for(&s.block),
                     collision: Arc::new(if is_air { Vec::new() } else { collision_for(&s.block, boxes) }),
                     friction: friction_for(&s.block),
+                    hardness: hardness.get(s.block.as_str()).map_or(1.0, |h| h.0),
+                    needs_tool: hardness.get(s.block.as_str()).is_some_and(|h| h.1),
                 }
             })
             .collect();

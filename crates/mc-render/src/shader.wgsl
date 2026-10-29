@@ -42,6 +42,24 @@ fn fs_opaque(i: VOut) -> @location(0) vec4<f32> {
     return vec4<f32>(fogged(t.rgb, i.dist), 1.0);
 }
 
+struct LineOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
+
+@vertex
+fn vs_line(@location(0) pos: vec3<f32>, @location(1) color: vec4<f32>) -> LineOut {
+    var o: LineOut;
+    o.clip = u.view_proj * vec4<f32>(pos, 1.0);
+    o.color = vec4<f32>(pow(color.rgb, vec3<f32>(2.2)), color.a);
+    return o;
+}
+
+@fragment
+fn fs_line(i: LineOut) -> @location(0) vec4<f32> {
+    return i.color;
+}
+
 @fragment
 fn fs_translucent(i: VOut) -> @location(0) vec4<f32> {
     let t = textureSample(atlas, atlas_sampler, i.uv) * i.color;

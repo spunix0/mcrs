@@ -7,6 +7,7 @@
 mod app;
 mod physics;
 mod session;
+mod target;
 
 use anyhow::{Context, Result};
 use session::{Event, Options};

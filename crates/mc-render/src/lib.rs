@@ -47,6 +47,23 @@ struct GpuChunk {
     max: Vec3,
 }
 
+/// A vertex of the line overlay (block outline, crosshair).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct LineVertex {
+    pub pos: [f32; 3],
+    pub color: [u8; 4],
+}
+
+const MAX_LINE_VERTICES: u64 = 8192;
+
+/// Lines drawn after the world: `world` is depth-tested (outlines), `top` is drawn over everything (crosshair).
+#[derive(Default)]
+pub struct Overlay {
+    pub world: Vec<LineVertex>,
+    pub top: Vec<LineVertex>,
+}
+
 pub struct FrameStats {
     pub drawn: usize,
     pub loaded: usize,
@@ -63,6 +80,9 @@ pub struct Renderer {
     depth: wgpu::TextureView,
     opaque: wgpu::RenderPipeline,
     translucent: wgpu::RenderPipeline,
+    lines_world: wgpu::RenderPipeline,
+    lines_top: wgpu::RenderPipeline,
+    line_buffer: wgpu::Buffer,
     uniforms: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     chunks: HashMap<(i32, i32), GpuChunk>,
@@ -248,9 +268,72 @@ impl Renderer {
         };
         let opaque = make("fs_opaque", None, true, Some(wgpu::Face::Back));
         let translucent = make("fs_translucent", Some(wgpu::BlendState::ALPHA_BLENDING), false, None);
+
+        let line_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<LineVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Unorm8x4],
+        };
+        let make_lines = |label: &str, compare: wgpu::CompareFunction| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_line"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(line_layout.clone())],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_line"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::LineList, ..Default::default() },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(compare),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let lines_world = make_lines("outline", wgpu::CompareFunction::LessEqual);
+        let lines_top = make_lines("crosshair", wgpu::CompareFunction::Always);
+        let line_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("lines"),
+            size: MAX_LINE_VERTICES * std::mem::size_of::<LineVertex>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let depth = depth_view(&device, config.width, config.height);
 
-        Ok(Self { surface, device, queue, config, depth, opaque, translucent, uniforms, bind_group, chunks: HashMap::new(), gpu_bytes: 0, adapter_name })
+        Ok(Self {
+            surface,
+            device,
+            queue,
+            config,
+            depth,
+            opaque,
+            translucent,
+            lines_world,
+            lines_top,
+            line_buffer,
+            uniforms,
+            bind_group,
+            chunks: HashMap::new(),
+            gpu_bytes: 0,
+            adapter_name,
+        })
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -265,6 +348,10 @@ impl Renderer {
 
     pub fn aspect(&self) -> f32 {
         self.config.width as f32 / self.config.height as f32
+    }
+
+    pub fn height(&self) -> u32 {
+        self.config.height
     }
 
     pub fn upload(&mut self, mesh: &ChunkMesh) {
@@ -286,7 +373,7 @@ impl Renderer {
         }
     }
 
-    pub fn render(&mut self, view_proj: Mat4, camera: Vec3, fog_end: f32) -> FrameStats {
+    pub fn render(&mut self, view_proj: Mat4, camera: Vec3, fog_end: f32, overlay: &Overlay) -> FrameStats {
         let mut stats = FrameStats { drawn: 0, loaded: self.chunks.len(), triangles: 0, gpu_bytes: self.gpu_bytes };
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -303,6 +390,13 @@ impl Renderer {
             sky: [SKY[0], SKY[1], SKY[2], 1.0],
         };
         self.queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
+        let mut lines = overlay.world.clone();
+        lines.extend_from_slice(&overlay.top);
+        lines.truncate(MAX_LINE_VERTICES as usize);
+        let (world_lines, line_count) = (overlay.world.len().min(lines.len()) as u32, lines.len() as u32);
+        if line_count > 0 {
+            self.queue.write_buffer(&self.line_buffer, 0, bytemuck::cast_slice(&lines));
+        }
 
         let mut visible_chunks: Vec<(&GpuChunk, f32)> = self
             .chunks
@@ -356,6 +450,13 @@ impl Renderer {
                     pass.set_index_buffer(m.indices.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..m.count, 0, 0..1);
                 }
+            }
+            if line_count > 0 {
+                pass.set_vertex_buffer(0, self.line_buffer.slice(..));
+                pass.set_pipeline(&self.lines_world);
+                pass.draw(0..world_lines, 0..1);
+                pass.set_pipeline(&self.lines_top);
+                pass.draw(world_lines..line_count, 0..1);
             }
         }
         self.queue.submit([encoder.finish()]);

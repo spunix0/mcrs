@@ -50,8 +50,12 @@ pub mod play {
         pub const CONFIGURATION_ACKNOWLEDGED: i32 = 16;
         pub const KEEP_ALIVE: i32 = 28;
         pub const MOVE_PLAYER_POS_ROT: i32 = 31;
+        pub const PLAYER_ACTION: i32 = 41;
         pub const PLAYER_LOADED: i32 = 44;
         pub const PONG: i32 = 45;
+        pub const SET_CARRIED_ITEM: i32 = 54;
+        pub const USE_ITEM_ON: i32 = 66;
+        pub const USE_ITEM: i32 = 67;
     }
     pub mod s2c {
         pub const BLOCK_UPDATE: i32 = 8;

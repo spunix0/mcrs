@@ -1,18 +1,19 @@
 //! The window: fly camera, chunk meshing on worker threads, rendering, and movement packets back to the server.
 
 use crate::physics::{self, Aabb, Body, Input};
-use crate::session::{self, Event};
+use crate::session::{self, Dig, Event};
+use crate::target::{self, Hit};
 use gilrs::{Axis, Button, Gilrs};
 use glam::{Mat4, Vec3};
 use mc_assets::BlockModels;
-use mc_render::{Area, ChunkMesh, Renderer};
+use mc_render::{Area, ChunkMesh, LineVertex, Overlay, Renderer};
 use mc_world::Chunk;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
-use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
@@ -25,17 +26,38 @@ const STICK_DEADZONE: f32 = 0.15;
 /// Degrees per second at full right-stick deflection.
 const PAD_LOOK_SPEED: f32 = 220.0;
 
-/// Gamepad state for one frame. A jumps/rises, clicking the right stick sneaks/lowers,
-/// clicking the left stick sprints, Y toggles walk/fly.
-#[derive(Default)]
+/// Gamepad state for one frame, already mapped to actions (Xbox layout):
+/// left stick move, right stick look, A jump (double-tap: fly), R3 sneak, L3 sprint,
+/// RT mine, LT use/place, LB/RB hotbar, Y inventory, B back.
+#[derive(Default, Clone, Copy)]
 struct Pad {
     left: [f32; 2],
     right: [f32; 2],
+    jump: bool,
+    sneak: bool,
     sprint: bool,
-    rise: bool,
-    lower: bool,
-    toggle: bool,
+    mine: bool,
+    use_item: bool,
+    prev_slot: bool,
+    next_slot: bool,
+    inventory: bool,
+    back: bool,
 }
+
+/// A block being mined in survival: the server checks how long we took, so we count ticks like vanilla.
+struct Mining {
+    pos: [i32; 3],
+    face: u8,
+    ticks: u32,
+    needed: u32,
+}
+
+/// Vanilla waits this many ticks after breaking a block before starting the next.
+const MINE_COOLDOWN: u8 = 5;
+/// Vanilla repeats "use" every 4 ticks while the button is held.
+const USE_COOLDOWN: u8 = 4;
+/// Two jump presses this close together toggle flying, like creative mode.
+const DOUBLE_TAP: Duration = Duration::from_millis(300);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Mode {
@@ -122,7 +144,17 @@ pub struct App {
     body: Body,
     prev_feet: [f64; 3],
     tick_time: f32,
-    pad_toggle_held: bool,
+    prev_pad: Pad,
+    last_jump_press: Option<Instant>,
+    mouse_mine: bool,
+    mouse_use: bool,
+    slot: u8,
+    sequence: i32,
+    mining: Option<Mining>,
+    mine_cooldown: u8,
+    use_cooldown: u8,
+    target: Option<Hit>,
+    inventory_open: bool,
     last_frame: Instant,
     frames: u32,
     fps_since: Instant,
@@ -177,7 +209,17 @@ impl App {
             body: Body::new([0.0, 80.0, 0.0]),
             prev_feet: [0.0, 80.0, 0.0],
             tick_time: 0.0,
-            pad_toggle_held: false,
+            prev_pad: Pad::default(),
+            last_jump_press: None,
+            mouse_mine: false,
+            mouse_use: false,
+            slot: 0,
+            sequence: 0,
+            mining: None,
+            mine_cooldown: 0,
+            use_cooldown: 0,
+            target: None,
+            inventory_open: false,
             last_frame: Instant::now(),
             frames: 0,
             fps_since: Instant::now(),
@@ -322,13 +364,20 @@ impl App {
             let scaled = ((len - STICK_DEADZONE) / (1.0 - STICK_DEADZONE)).min(1.0);
             [v[0] / len * scaled, v[1] / len * scaled]
         };
+        // Triggers are analog on most pads; treat past half-pull as pressed.
+        let trigger = |b: Button| pad.button_data(b).map_or(pad.is_pressed(b), |d| d.value() > 0.5);
         Pad {
             left: stick(Axis::LeftStickX, Axis::LeftStickY),
             right: stick(Axis::RightStickX, Axis::RightStickY),
+            jump: pad.is_pressed(Button::South),
+            sneak: pad.is_pressed(Button::RightThumb),
             sprint: pad.is_pressed(Button::LeftThumb),
-            rise: pad.is_pressed(Button::South),
-            lower: pad.is_pressed(Button::RightThumb),
-            toggle: pad.is_pressed(Button::North),
+            mine: trigger(Button::RightTrigger2),
+            use_item: trigger(Button::LeftTrigger2),
+            prev_slot: pad.is_pressed(Button::LeftTrigger),
+            next_slot: pad.is_pressed(Button::RightTrigger),
+            inventory: pad.is_pressed(Button::North),
+            back: pad.is_pressed(Button::East),
         }
     }
 
@@ -358,13 +407,177 @@ impl App {
         [x, y - EYE_HEIGHT, z]
     }
 
+    /// Jump was just pressed: a second press within [`DOUBLE_TAP`] toggles flying.
+    fn jump_pressed(&mut self) {
+        match self.last_jump_press {
+            Some(t) if t.elapsed() < DOUBLE_TAP => {
+                self.last_jump_press = None;
+                self.toggle_mode();
+            }
+            _ => self.last_jump_press = Some(Instant::now()),
+        }
+    }
+
+    fn select_slot(&mut self, slot: u8) {
+        self.slot = slot % 9;
+        let _ = session::send_hotbar_slot(&self.tx, self.slot);
+    }
+
+    fn next_sequence(&mut self) -> i32 {
+        self.sequence += 1;
+        self.sequence
+    }
+
+    // No inventory screen exists yet (milestone 5); these keep the buttons wired so the GUI can take them over.
+    fn toggle_inventory(&mut self) {
+        self.inventory_open = !self.inventory_open;
+        println!("[ui] inventory {} (the screen itself comes with the GUI milestone)", if self.inventory_open { "open" } else { "closed" });
+    }
+
+    fn back(&mut self) {
+        if self.inventory_open {
+            self.toggle_inventory();
+        }
+    }
+
+    /// One tick of mining and using, run with the physics. Mirrors vanilla's `continueDestroyBlock` and `startUseItem`.
+    fn interact_tick(&mut self, mine: bool, use_item: bool) {
+        self.mine_cooldown = self.mine_cooldown.saturating_sub(1);
+        self.use_cooldown = self.use_cooldown.saturating_sub(1);
+        let target = self.target.as_ref().map(|t| (t.pos, t.face, t.point));
+
+        if !mine {
+            if let Some(m) = self.mining.take() {
+                let seq = self.next_sequence();
+                let _ = session::send_dig(&self.tx, Dig::Abort, m.pos, m.face, seq);
+            }
+        } else if self.mine_cooldown == 0 {
+            match (target, &mut self.mining) {
+                (Some((pos, _, _)), Some(m)) if m.pos == pos => {
+                    m.ticks += 1;
+                    if m.ticks >= m.needed {
+                        let (pos, face) = (m.pos, m.face);
+                        self.mining = None;
+                        let seq = self.next_sequence();
+                        let _ = session::send_dig(&self.tx, Dig::Stop, pos, face, seq);
+                        self.mine_cooldown = MINE_COOLDOWN;
+                    }
+                }
+                (Some((pos, face, _)), _) => {
+                    if let Some(m) = self.mining.take() {
+                        let seq = self.next_sequence();
+                        let _ = session::send_dig(&self.tx, Dig::Abort, m.pos, m.face, seq);
+                    }
+                    let world = WorldView { chunks: &self.world, models: &self.models };
+                    let needed = world.state(pos[0], pos[1], pos[2]).and_then(|s| s.break_ticks(self.body.on_ground));
+                    if let Some(needed) = needed {
+                        let seq = self.next_sequence();
+                        let _ = session::send_dig(&self.tx, Dig::Start, pos, face, seq);
+                        if needed <= 1 {
+                            // Breaks instantly (grass, flowers, torches).
+                            self.mine_cooldown = MINE_COOLDOWN;
+                        } else {
+                            self.mining = Some(Mining { pos, face, ticks: 1, needed });
+                        }
+                    }
+                }
+                (None, _) => {
+                    if let Some(m) = self.mining.take() {
+                        let seq = self.next_sequence();
+                        let _ = session::send_dig(&self.tx, Dig::Abort, m.pos, m.face, seq);
+                    }
+                }
+            }
+        }
+
+        if use_item && self.use_cooldown == 0 {
+            let seq = self.next_sequence();
+            let _ = match target {
+                Some((pos, face, point)) => session::send_use_on(&self.tx, pos, face, point, seq),
+                None => session::send_use(&self.tx, seq, [self.cam.yaw, self.cam.pitch]),
+            };
+            self.use_cooldown = USE_COOLDOWN;
+        }
+    }
+
+    /// Updates the crosshair target from the current camera.
+    fn update_target(&mut self) {
+        if self.mode == Mode::Fly || !self.in_world {
+            self.target = None;
+            return;
+        }
+        let look = self.cam.look();
+        let world = WorldView { chunks: &self.world, models: &self.models };
+        self.target = target::raycast(self.cam.eye, [look.x as f64, look.y as f64, look.z as f64], target::REACH, |x, y, z| {
+            let Some(s) = world.state(x, y, z) else { return Vec::new() };
+            let (fx, fy, fz) = (x as f64, y as f64, z as f64);
+            let to_world = |b: &[f32; 6]| Aabb {
+                min: [fx + b[0] as f64, fy + b[1] as f64, fz + b[2] as f64],
+                max: [fx + b[3] as f64, fy + b[4] as f64, fz + b[5] as f64],
+            };
+            if !s.collision.is_empty() {
+                s.collision.iter().map(to_world).collect()
+            } else if !s.quads.is_empty() {
+                // Plants and other walk-through blocks are still targetable.
+                vec![to_world(&[0.0, 0.0, 0.0, 1.0, 1.0, 1.0])]
+            } else {
+                Vec::new()
+            }
+        });
+    }
+
+    fn overlay(&self, height: u32) -> Overlay {
+        let mut o = Overlay::default();
+        if let Some(t) = &self.target {
+            let c = [0, 0, 0, 110];
+            for b in &t.boxes {
+                let (lo, hi) = (b.min.map(|v| v as f32 - 0.002), b.max.map(|v| v as f32 + 0.002));
+                let p = |i: usize| [if i & 1 == 0 { lo[0] } else { hi[0] }, if i & 2 == 0 { lo[1] } else { hi[1] }, if i & 4 == 0 { lo[2] } else { hi[2] }];
+                for (a, b) in [(0, 1), (2, 3), (4, 5), (6, 7), (0, 2), (1, 3), (4, 6), (5, 7), (0, 4), (1, 5), (2, 6), (3, 7)] {
+                    o.world.push(LineVertex { pos: p(a), color: c });
+                    o.world.push(LineVertex { pos: p(b), color: c });
+                }
+            }
+        }
+        if self.mode == Mode::Walk {
+            // Crosshair: two lines half a block in front of the eye, sized in pixels.
+            let look = self.cam.look();
+            let right = look.cross(Vec3::Y).normalize();
+            let up = right.cross(look);
+            let eye = Vec3::new(self.cam.eye[0] as f32, self.cam.eye[1] as f32, self.cam.eye[2] as f32);
+            let (d, arm_px) = (0.5, 9.0);
+            let arm = 2.0 * d * (35f32.to_radians()).tan() / height.max(1) as f32 * arm_px;
+            let center = eye + look * d;
+            let c = [255, 255, 255, 220];
+            for (a, b) in [(center - right * arm, center + right * arm), (center - up * arm, center + up * arm)] {
+                o.top.push(LineVertex { pos: a.into(), color: c });
+                o.top.push(LineVertex { pos: b.into(), color: c });
+            }
+        }
+        o
+    }
+
     fn update(&mut self, dt: f32) {
         let pad = self.pad();
-        if pad.toggle && !self.pad_toggle_held {
-            self.toggle_mode();
+        let prev = std::mem::replace(&mut self.prev_pad, pad);
+        let pressed = |now: bool, before: bool| now && !before;
+        if pressed(pad.jump, prev.jump) {
+            self.jump_pressed();
         }
-        self.pad_toggle_held = pad.toggle;
-        let Pad { left, right: right_stick, sprint: pad_sprint, rise, lower, .. } = pad;
+        if pressed(pad.next_slot, prev.next_slot) {
+            self.select_slot(self.slot + 1);
+        }
+        if pressed(pad.prev_slot, prev.prev_slot) {
+            self.select_slot(self.slot + 8);
+        }
+        if pressed(pad.inventory, prev.inventory) {
+            self.toggle_inventory();
+        }
+        if pressed(pad.back, prev.back) {
+            self.back();
+        }
+        let (left, right_stick, pad_sprint, rise, lower) = (pad.left, pad.right, pad.sprint, pad.jump, pad.sneak);
+        let (mine, use_item) = (self.mouse_mine || pad.mine, self.mouse_use || pad.use_item);
         // Squared response gives fine control near the center and full speed at the edge.
         let curve = |v: f32| v * v.abs();
         self.cam.yaw += curve(right_stick[0]) * PAD_LOOK_SPEED * dt;
@@ -382,20 +595,21 @@ impl App {
         };
 
         if self.mode == Mode::Walk {
-            self.walk(&input, dt);
+            self.walk(&input, mine, use_item, dt);
         } else {
             self.fly(dt, sprint, left, rise, lower);
         }
     }
 
     /// Fixed 20 Hz physics ticks, each followed by one movement packet, with the camera interpolated in between.
-    fn walk(&mut self, input: &Input, dt: f32) {
+    fn walk(&mut self, input: &Input, mine: bool, use_item: bool, dt: f32) {
         if !self.in_world {
             return;
         }
         self.tick_time = (self.tick_time + dt).min(0.25);
         while self.tick_time >= TICK {
             self.tick_time -= TICK;
+            self.interact_tick(mine, use_item);
             self.prev_feet = self.body.pos;
             let world = WorldView { chunks: &self.world, models: &self.models };
             self.body.tick(input, self.cam.yaw, &world);
@@ -447,13 +661,15 @@ impl App {
         self.last_frame = now;
         self.drain();
         self.update(dt);
+        self.update_target();
+        let overlay = self.overlay(self.renderer.as_ref().map_or(720, Renderer::height));
         let Some(r) = &mut self.renderer else { return };
         let eye = Vec3::new(self.cam.eye[0] as f32, self.cam.eye[1] as f32, self.cam.eye[2] as f32);
         let view = glam::camera::rh::view::look_to_mat4(eye, self.cam.look(), Vec3::Y);
         let fog_end = self.view_distance as f32 * 16.0;
         // DirectX convention = wgpu's: Y up in clip space, depth 0..1. Far plane covers the fog distance plus world height.
         let proj: Mat4 = glam::camera::rh::proj::directx::perspective(70f32.to_radians(), r.aspect(), 0.05, fog_end * 1.5 + 400.0);
-        let stats = r.render(proj * view, eye, fog_end);
+        let stats = r.render(proj * view, eye, fog_end, &overlay);
         if !self.first_frame {
             self.first_frame = true;
             println!("first frame after {:?} ({})", self.started.elapsed(), r.adapter_name);
@@ -466,12 +682,13 @@ impl App {
             if let Some(w) = &self.window {
                 let [x, y, z] = self.cam.eye;
                 w.set_title(&format!(
-                    "mcrs · Rust Edition  |  {fps:.0} fps  |  {}/{} chunks  |  {:.1}M tris  |  {} MB GPU  |  {x:.0} {y:.0} {z:.0}  |  {:?}  |  {}",
+                    "mcrs · Rust Edition  |  {fps:.0} fps  |  {}/{} chunks  |  {:.1}M tris  |  {} MB GPU  |  {x:.0} {y:.0} {z:.0}  |  {:?}  |  slot {}  |  {}",
                     stats.drawn,
                     stats.loaded,
                     stats.triangles as f64 / 1e6,
                     stats.gpu_bytes / 1_048_576,
                     self.mode,
+                    self.slot + 1,
                     self.status
                 ));
             }
@@ -515,15 +732,48 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Focused(true) => self.focused = true,
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } if !self.grabbed => self.set_grab(true),
+            WindowEvent::MouseInput { state, button, .. } => {
+                let down = state == ElementState::Pressed;
+                match button {
+                    MouseButton::Left => self.mouse_mine = down,
+                    MouseButton::Right => self.mouse_use = down,
+                    _ => {}
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } if self.grabbed => {
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32,
+                };
+                // Scrolling down moves right along the hotbar, like vanilla.
+                if dy < 0.0 {
+                    self.select_slot(self.slot + 1);
+                } else if dy > 0.0 {
+                    self.select_slot(self.slot + 8);
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     match event.state {
                         ElementState::Pressed => {
-                            if code == KeyCode::Escape {
-                                self.set_grab(false);
-                            }
-                            if code == KeyCode::KeyF && !event.repeat {
-                                self.toggle_mode();
+                            if !event.repeat {
+                                match code {
+                                    KeyCode::Escape => {
+                                        self.back();
+                                        self.set_grab(false);
+                                    }
+                                    KeyCode::KeyF => self.toggle_mode(),
+                                    KeyCode::Space => self.jump_pressed(),
+                                    KeyCode::KeyE => self.toggle_inventory(),
+                                    _ => {}
+                                }
+                                let digits = [
+                                    KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4, KeyCode::Digit5,
+                                    KeyCode::Digit6, KeyCode::Digit7, KeyCode::Digit8, KeyCode::Digit9,
+                                ];
+                                if let Some(i) = digits.iter().position(|d| *d == code) {
+                                    self.select_slot(i as u8);
+                                }
                             }
                             self.keys.insert(code);
                         }

@@ -60,6 +60,51 @@ pub fn send_chat(tx: &Sender, line: &str) -> Result<()> {
 }
 
 /// One client tick's movement. The server allows a single position per tick, and a tick ends with `client_tick_end`.
+fn pack_block_pos([x, y, z]: [i32; 3]) -> i64 {
+    ((x as i64 & 0x3ff_ffff) << 38) | ((z as i64 & 0x3ff_ffff) << 12) | (y as i64 & 0xfff)
+}
+
+/// Mining actions of `player_action`.
+#[derive(Clone, Copy)]
+pub enum Dig {
+    Start = 0,
+    Abort = 2,
+    Stop = 3,
+}
+
+/// `sequence` lets the server acknowledge the change so the client could roll back predictions.
+pub fn send_dig(tx: &Sender, action: Dig, pos: [i32; 3], face: u8, sequence: i32) -> Result<()> {
+    tx.send(play::c2s::PLAYER_ACTION, &Writer::new().varint(action as i32).i64(pack_block_pos(pos)).u8(face).varint(sequence).buf)?;
+    Ok(())
+}
+
+/// Right-click on a block face with the main hand (place a block, open a door, ...).
+pub fn send_use_on(tx: &Sender, pos: [i32; 3], face: u8, point: [f64; 3], sequence: i32) -> Result<()> {
+    let mut w = Writer::new();
+    w.varint(0) // main hand
+        .i64(pack_block_pos(pos))
+        .varint(face as i32)
+        .f32((point[0] - pos[0] as f64) as f32)
+        .f32((point[1] - pos[1] as f64) as f32)
+        .f32((point[2] - pos[2] as f64) as f32)
+        .bool(false) // inside the block
+        .bool(false) // world border
+        .varint(sequence);
+    tx.send(play::c2s::USE_ITEM_ON, &w.buf)?;
+    Ok(())
+}
+
+/// Right-click in the air with the main hand (eat, throw, ...).
+pub fn send_use(tx: &Sender, sequence: i32, rot: [f32; 2]) -> Result<()> {
+    tx.send(play::c2s::USE_ITEM, &Writer::new().varint(0).varint(sequence).f32(rot[0]).f32(rot[1]).buf)?;
+    Ok(())
+}
+
+pub fn send_hotbar_slot(tx: &Sender, slot: u8) -> Result<()> {
+    tx.send(play::c2s::SET_CARRIED_ITEM, &Writer::new().u16(slot as u16).buf)?;
+    Ok(())
+}
+
 /// `flags`: bit 0 = on ground, bit 1 = horizontal collision.
 pub fn send_tick(tx: &Sender, pos: [f64; 3], rot: [f32; 2], flags: u8) -> Result<()> {
     let [x, y, z] = pos;
@@ -261,6 +306,13 @@ fn component(r: &mut Reader) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_pos_round_trips() {
+        for p in [[0, 64, 0], [-5, -60, 12], [30_000_000, 319, -30_000_000]] {
+            assert_eq!(mc_world::unpack_block_pos(pack_block_pos(p)), p);
+        }
+    }
 
     #[test]
     fn offline_uuid_matches_java() {
