@@ -91,5 +91,7 @@ pub mod play {
         pub const SET_HEALTH: i32 = 106;
         pub const START_CONFIGURATION: i32 = 120;
         pub const SYSTEM_CHAT: i32 = 124;
+        pub const PLAYER_CHAT: i32 = 66;
+        pub const DISGUISED_CHAT: i32 = 33;
     }
 }

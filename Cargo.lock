@@ -2123,6 +2123,7 @@ dependencies = [
  "gilrs",
  "glam",
  "mc-assets",
+ "mc-nbt",
  "mc-protocol",
  "mc-render",
  "mc-world",

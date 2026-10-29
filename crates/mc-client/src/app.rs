@@ -168,6 +168,12 @@ pub struct App {
     attack_cooldown: u8,
     inventory_open: bool,
     inventory: Inventory,
+    health: f32,
+    food: i32,
+    /// Recent chat lines and when they arrived.
+    chat_log: Vec<(String, Instant)>,
+    /// The line being typed, while the chat box is open.
+    chat_input: Option<String>,
     /// Chat lines or commands to send once in the world (`--run`).
     pub join_commands: Vec<String>,
     /// `None` if there's no audio device or the sound assets are missing.
@@ -250,6 +256,10 @@ impl App {
             attack_cooldown: 0,
             inventory_open: false,
             inventory: Inventory::default(),
+            health: 20.0,
+            food: 20,
+            chat_log: Vec::new(),
+            chat_input: None,
             join_commands: Vec::new(),
             audio: None,
             pending_place: None,
@@ -366,7 +376,10 @@ impl App {
                     self.cam.yaw = rot[0];
                     self.cam.pitch = rot[1];
                 }
-                Event::Chat(msg) => println!("[chat] {msg}"),
+                Event::Chat(msg) => {
+                    println!("[chat] {msg}");
+                    self.chat_log.push((msg, Instant::now()));
+                }
                 Event::Sound { event, at, entity, volume, pitch } => {
                     let at = at.or_else(|| entity.and_then(|id| self.entities.map.get(&id)).map(|e| e.render_pos(Instant::now())));
                     let name = match event {
@@ -392,7 +405,13 @@ impl App {
                         self.entities.map.remove(&id);
                     }
                 }
-                Event::Health(_) => {}
+                Event::Health { health, food } => (self.health, self.food) = (health, food),
+                Event::ChatTag(tag) => {
+                    let lang = &self.models.lang;
+                    let line = mc_protocol::text::render(&tag, &|k| lang.get(k).cloned());
+                    println!("[chat] {line}");
+                    self.chat_log.push((line, Instant::now()));
+                }
                 Event::Inventory(items) => {
                     for (slot, item) in items.into_iter().enumerate().take(self.inventory.slots.len()) {
                         self.inventory.slots[slot] = item;
@@ -533,6 +552,11 @@ impl App {
             let _ = self.tx.send(mc_protocol::ids::play::c2s::CONTAINER_CLOSE, &mc_protocol::Writer::new().varint(0).buf);
             self.set_grab(true);
         }
+    }
+
+    fn close_chat(&mut self) {
+        self.chat_input = None;
+        self.set_grab(true);
     }
 
     fn back(&mut self) {
@@ -887,6 +911,10 @@ impl App {
         let mut painter = Painter::new(&self.models, w, h);
         if self.in_world {
             hud::hotbar(&mut painter, &self.inventory, self.slot);
+            if self.mode == Mode::Walk {
+                hud::status(&mut painter, self.health, self.food);
+            }
+            hud::chat(&mut painter, &self.chat_log, self.chat_input.as_deref());
         }
         if self.inventory_open {
             overlay.top.clear();
@@ -985,10 +1013,40 @@ impl ApplicationHandler for App {
                     self.select_slot(self.slot + 8);
                 }
             }
+            WindowEvent::KeyboardInput { event, .. } if self.chat_input.is_some() => {
+                if event.state != ElementState::Pressed {
+                    return;
+                }
+                match event.physical_key {
+                    PhysicalKey::Code(KeyCode::Escape) => self.close_chat(),
+                    PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter) => {
+                        let line = self.chat_input.take().unwrap_or_default();
+                        if !line.trim().is_empty() {
+                            let _ = session::send_chat(&self.tx, line.trim());
+                        }
+                        self.close_chat();
+                    }
+                    PhysicalKey::Code(KeyCode::Backspace) => {
+                        self.chat_input.as_mut().map(String::pop);
+                    }
+                    _ => {
+                        if let (Some(text), Some(input)) = (&event.text, &mut self.chat_input) {
+                            // Vanilla caps chat at 256 characters.
+                            input.extend(text.chars().filter(|c| !c.is_control()).take(256usize.saturating_sub(input.len())));
+                        }
+                    }
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     match event.state {
                         ElementState::Pressed => {
+                            if !event.repeat && !self.inventory_open && matches!(code, KeyCode::KeyT | KeyCode::Slash) {
+                                self.chat_input = Some(if code == KeyCode::Slash { "/".into() } else { String::new() });
+                                self.keys.clear();
+                                self.set_grab(false);
+                                return;
+                            }
                             if !event.repeat {
                                 match code {
                                     KeyCode::Escape => {

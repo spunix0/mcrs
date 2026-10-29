@@ -299,6 +299,8 @@ pub struct BlockModels {
     pub sound_events: Vec<String>,
     /// Entity types by protocol ID.
     pub entities: Vec<EntityInfo>,
+    /// English translations (`en_us.json`), e.g. `block.minecraft.stone` -> `Stone`.
+    pub lang: HashMap<String, String>,
 }
 
 /// `(registry name -> entries in protocol-ID order)` from the server's `reports/registries.json`.
@@ -436,6 +438,10 @@ impl BlockModels {
             })
             .collect();
         let gui = GuiAtlas::load(&mut jar)?;
+        let lang: HashMap<String, String> = jar
+            .json("assets/minecraft/lang/en_us.json")
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
         let water_uv = atlas.rect("minecraft:block/water_still");
         let lava_uv = atlas.rect("minecraft:block/lava_still");
         let crack_uv = std::array::from_fn(|i| atlas.rect(&format!("minecraft:block/destroy_stage_{i}")));
@@ -479,6 +485,6 @@ impl BlockModels {
                 }
             })
             .collect();
-        Ok(Self { states, atlas, water_uv, lava_uv, crack_uv, items, components, gui, sound_types: sound_types(), sound_events, entities })
+        Ok(Self { states, atlas, water_uv, lava_uv, crack_uv, items, components, gui, sound_types: sound_types(), sound_events, entities, lang })
     }
 }

@@ -136,7 +136,8 @@ fn headless(args: &[String], addr: &str, name: &str, greet: bool) -> Result<()> 
         }
         Event::Teleport(p, _) => println!("position {:.2} {:.2} {:.2}", p[0], p[1], p[2]),
         Event::Chat(m) => println!("[chat] {m}"),
-        Event::Health(h) => println!("health {h:.1}"),
+        Event::Health { health, .. } => println!("health {health:.1}"),
+        Event::ChatTag(t) => println!("[chat] {}", mc_protocol::text::plain(&t)),
         Event::Forget(..) | Event::Blocks(_) | Event::Light(..) => {}
         Event::Inventory(_) | Event::InventorySlot(..) | Event::PlayerSlot(..) | Event::HeldSlot(_) => {}
         Event::Sound { .. } | Event::LevelEvent { .. } => {}

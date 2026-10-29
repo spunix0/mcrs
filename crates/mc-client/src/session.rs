@@ -43,7 +43,9 @@ pub enum Event {
     /// Server moved us: feet position and yaw/pitch.
     Teleport([f64; 3], [f32; 2]),
     Chat(String),
-    Health(f32),
+    Health { health: f32, food: i32 },
+    /// A chat line as a text component (translated by the client).
+    ChatTag(mc_nbt::Tag),
 }
 
 /// A sound event either by registry ID or spelled out (custom sounds).
@@ -64,6 +66,52 @@ fn sound_ref(r: &mut Reader) -> Result<SoundRef> {
     } else {
         Ok(SoundRef::Id(h as u32 - 1))
     }
+}
+
+/// `<name> message`, as vanilla's `chat.type.text` renders it.
+fn chat_line(name: mc_nbt::Tag, message: mc_nbt::Tag) -> mc_nbt::Tag {
+    use mc_nbt::Tag;
+    Tag::Compound(vec![("translate".into(), Tag::String("chat.type.text".into())), ("with".into(), Tag::List(vec![name, message]))])
+}
+
+/// `ChatType.Bound`: chat type (registry ID + 1; inline types aren't supported), sender name, optional target.
+fn chat_bound(r: &mut Reader) -> Result<Option<(mc_nbt::Tag, Option<mc_nbt::Tag>)>> {
+    if r.varint()? == 0 {
+        return Ok(None);
+    }
+    let name = r.nbt()?.unwrap_or(mc_nbt::Tag::String(String::new()));
+    let target = if r.bool()? { r.nbt()? } else { None };
+    Ok(Some((name, target)))
+}
+
+/// `ClientboundPlayerChatPacket` -> a `<name> message` line. Signatures are read past, not checked.
+fn player_chat(r: &mut Reader) -> Result<Option<mc_nbt::Tag>> {
+    let _global_index = r.varint()?;
+    let _sender = r.uuid()?;
+    let _index = r.varint()?;
+    if r.bool()? {
+        r.bytes(256)?;
+    }
+    let content = r.string()?;
+    let (_timestamp, _salt) = (r.i64()?, r.i64()?);
+    for _ in 0..r.len()? {
+        // Last-seen entries: 0 = full signature follows, otherwise a cache index + 1.
+        if r.varint()? == 0 {
+            r.bytes(256)?;
+        }
+    }
+    let unsigned = if r.bool()? { r.nbt()? } else { None };
+    // Filter mask: 0 pass-through, 1 fully filtered, 2 partial (bitset follows).
+    let filter = r.varint()?;
+    if filter == 2 {
+        let n = r.len()?;
+        r.bytes(n)?;
+    }
+    if filter == 1 {
+        return Ok(None);
+    }
+    let message = unsigned.unwrap_or(mc_nbt::Tag::String(content));
+    Ok(chat_bound(r)?.map(|(name, _)| chat_line(name, message)))
 }
 
 /// Angles are sent as 1/256 of a turn.
@@ -466,10 +514,12 @@ pub fn run(opts: &Options, tx: Sender, mut rx: mc_protocol::Receiver, mut emit: 
                     // Dead players get no chunks until they respawn; press "Respawn" right away.
                     tx.send(play::c2s::CLIENT_COMMAND, &Writer::new().varint(0).buf)?;
                 }
-                emit(Event::Health(health));
+                emit(Event::Health { health, food: r.varint()? });
             }
             (State::Play, play::s2c::SYSTEM_CHAT) => {
-                let msg = component(&mut r);
+                let tag = r.nbt().ok().flatten();
+                let overlay = r.bool().unwrap_or(false);
+                let msg = tag.as_ref().map(text::plain).unwrap_or_default();
                 if opts.greet {
                     if let Some(who) = msg.strip_prefix("multiplayer.player.joined [").and_then(|s| s.strip_suffix(']')) {
                         if who != name {
@@ -477,7 +527,23 @@ pub fn run(opts: &Options, tx: Sender, mut rx: mc_protocol::Receiver, mut emit: 
                         }
                     }
                 }
-                emit(Event::Chat(msg));
+                // Overlay messages go above the hotbar in vanilla; we show them in chat for now.
+                let _ = overlay;
+                match tag {
+                    Some(tag) => emit(Event::ChatTag(tag)),
+                    None => emit(Event::Chat(msg)),
+                }
+            }
+            (State::Play, play::s2c::PLAYER_CHAT) => {
+                if let Some(tag) = player_chat(&mut r).ok().flatten() {
+                    emit(Event::ChatTag(tag));
+                }
+            }
+            (State::Play, play::s2c::DISGUISED_CHAT) => {
+                let message = r.nbt()?.unwrap_or(mc_nbt::Tag::String(String::new()));
+                if let Some((name, _)) = chat_bound(&mut r).ok().flatten() {
+                    emit(Event::ChatTag(chat_line(name, message)));
+                }
             }
             (State::Play, play::s2c::DISCONNECT) => return Ok(component(&mut r)),
             (State::Play, play::s2c::START_CONFIGURATION) => {

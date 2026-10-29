@@ -95,6 +95,56 @@ pub fn hotbar(p: &mut Painter, inv: &Inventory, selected: u8) {
     }
 }
 
+/// Hearts (left) and hunger (right) above the hotbar, as in vanilla's `Gui.renderPlayerHealth`.
+pub fn status(p: &mut Painter, health: f32, food: i32) {
+    let center = (p.width / 2.0).floor();
+    let y = p.height - 39.0;
+    let hp = health.ceil().max(0.0) as i32;
+    for i in 0..10 {
+        let x = center - 91.0 + i as f32 * 8.0;
+        p.sprite("heart_container", x, y);
+        if hp >= (i + 1) * 2 {
+            p.sprite("heart_full", x, y);
+        } else if hp == i * 2 + 1 {
+            p.sprite("heart_half", x, y);
+        }
+        let fx = center + 91.0 - 9.0 - i as f32 * 8.0;
+        p.sprite("food_empty", fx, y);
+        if food >= (i + 1) * 2 {
+            p.sprite("food_full", fx, y);
+        } else if food == i * 2 + 1 {
+            p.sprite("food_half", fx, y);
+        }
+    }
+}
+
+/// Only ASCII glyphs are in the bitmap font we load; anything else shows as `?`.
+fn ascii(s: &str) -> String {
+    s.chars().map(|c| if c.is_ascii() && !c.is_control() { c } else { '?' }).collect()
+}
+
+/// Recent chat (bottom-left, fading out after 10 seconds) and the input line while typing.
+pub fn chat(p: &mut Painter, log: &[(String, std::time::Instant)], input: Option<&str>) {
+    let typing = input.is_some();
+    let mut y = p.height - 48.0;
+    if let Some(line) = input {
+        p.fill(2.0, p.height - 14.0, p.width - 4.0, 12.0, [0, 0, 0, 128]);
+        p.text(&format!("{}_", ascii(line)), 4.0, p.height - 12.0, WHITE);
+    }
+    let shown = if typing { 20 } else { 10 };
+    for (line, at) in log.iter().rev().take(shown) {
+        let age = at.elapsed().as_secs_f32();
+        if !typing && age > 10.0 {
+            break;
+        }
+        // Fade over the last second like vanilla.
+        let alpha = if typing { 1.0 } else { (10.0 - age).clamp(0.0, 1.0) };
+        p.fill(2.0, y - 1.0, 320.0, 9.0, [0, 0, 0, (128.0 * alpha) as u8]);
+        p.text(&ascii(line), 4.0, y, [255, 255, 255, (255.0 * alpha) as u8]);
+        y -= 9.0;
+    }
+}
+
 /// Top-left corner of each menu slot of the player inventory screen, relative to the 176x166 background.
 fn slot_pos(slot: usize) -> Option<(f32, f32)> {
     let s = slot as f32;
@@ -139,13 +189,19 @@ pub fn inventory_screen(p: &mut Painter, inv: &Inventory, mouse: (f32, f32)) -> 
         }
     }
     if let Some(s) = hovered.and_then(|h| inv.slots[h].as_ref()) {
-        let name = s.name.clone().unwrap_or_else(|| p.models.items.get(s.item as usize).map_or("?".into(), |i| pretty(&i.name)));
+        let lang = &p.models.lang;
+        let name = s.name.clone().unwrap_or_else(|| {
+            p.models.items.get(s.item as usize).map_or("?".into(), |i| {
+                // Vanilla names: item.minecraft.x or block.minecraft.x in en_us.json.
+                lang.get(&format!("item.minecraft.{}", i.name)).or_else(|| lang.get(&format!("block.minecraft.{}", i.name))).cloned().unwrap_or_else(|| pretty(&i.name))
+            })
+        });
         let w = p.models.gui.text_width(&name);
         let (tx, ty) = (mx + 12.0, my - 12.0);
         // Vanilla tooltip: dark purple-black box with a lighter border.
         p.fill(tx - 3.0, ty - 3.0, w + 6.0, 14.0, [16, 0, 16, 240]);
         p.fill(tx - 2.0, ty - 2.0, w + 4.0, 1.0, [80, 0, 255, 80]);
-        p.text(&name, tx, ty, if s.enchanted { [85, 255, 255, 255] } else { WHITE });
+        p.text(&ascii(&name), tx, ty, if s.enchanted { [85, 255, 255, 255] } else { WHITE });
     }
     hovered
 }
