@@ -9,6 +9,10 @@ pub struct Settings {
     pub memory_mb: u32,
     pub java_override: String,
     pub show_snapshots: bool,
+    /// The user ticked "I accept the Minecraft EULA" (needed to run the world server).
+    pub eula_accepted: bool,
+    /// Singleplayer world folder name under `worlds/`.
+    pub world: String,
 }
 
 impl Default for Settings {
@@ -19,6 +23,8 @@ impl Default for Settings {
             memory_mb: 4096,
             java_override: String::new(),
             show_snapshots: false,
+            eula_accepted: false,
+            world: "world".into(),
         }
     }
 }

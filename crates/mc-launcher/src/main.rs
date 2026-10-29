@@ -6,6 +6,7 @@ mod install;
 mod launch;
 mod meta;
 mod settings;
+mod singleplayer;
 mod theme;
 mod ui;
 

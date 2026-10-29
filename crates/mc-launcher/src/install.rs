@@ -329,3 +329,8 @@ pub fn prepare(paths: &Paths, id: &str, manifest: Option<&Manifest>, progress: &
     let java = paths.java_exe(&v.java_version.component);
     Ok(Prepared { version: v, java })
 }
+
+/// Downloads one file (skipped if already the right size), verifying its SHA-1.
+pub fn fetch(url: &str, dest: &Path, sha1: &str, size: u64, progress: &Arc<Progress>) -> Result<()> {
+    run_jobs(vec![Job { url: url.to_string(), dest: dest.to_path_buf(), sha1: Some(sha1.to_string()), size }], progress)
+}

@@ -29,7 +29,7 @@ No external dependencies yet; add them per crate as each milestone starts.
 3. Chunks render with textures (done: block models + atlas with mipmaps, wgpu, smooth light + AO from server light data, block/light updates, cross-chunk culling; ~1.4s to first frame. Still to do: benchmark vs vanilla 26.3, Sodium-style compact vertices)
 4. Walk with correct physics, mouse + Xbox controller
 5. Entities, GUI, sound
-6. One-click singleplayer via local server
+6. One-click singleplayer via local server (done in the launcher: EULA checkbox, hidden world server, Rust client)
 
 ## Gotchas
 - Everything lives in `C:\Users\nooak\mcrs`: `build` (cargo target), `data` (launcher installs, game dir), `server` (local test server).

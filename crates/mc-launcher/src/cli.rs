@@ -50,6 +50,21 @@ pub fn run(args: &[String]) -> bool {
     };
     println!("installed {id}; java at {}", prepared.java.display());
 
+    if args.iter().any(|a| a == "--singleplayer") {
+        // Only for scripted testing: the UI asks for EULA acceptance; here `--accept-eula` must be passed explicitly.
+        let settings = Settings::load(&paths.root);
+        let eula = args.iter().any(|a| a == "--accept-eula") || settings.eula_accepted;
+        match crate::singleplayer::start(&paths, &prepared, &settings.username, &settings.world, eula, &progress) {
+            Ok(mut running) => {
+                println!("world running; Rust client pid {}", running.client.id());
+                let _ = running.client.wait();
+                println!("client closed; saving world");
+                crate::singleplayer::stop(running);
+            }
+            Err(e) => eprintln!("singleplayer failed: {e:#}"),
+        }
+        return true;
+    }
     if args.iter().any(|a| a == "--launch") {
         let settings = Settings::load(&paths.root);
         let account = Account::offline(&settings.username);
