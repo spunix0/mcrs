@@ -1,6 +1,6 @@
 ﻿//! Game client: window and input loop (winit, gilrs), prediction and player physics, ties the other crates together.
 //!
-//! `mc-client [--connect 127.0.0.1:25565] [--name Player] [--view-distance 32] [--no-vsync] [--no-noclip]` opens a window and renders the world.
+//! `mc-client [--connect 127.0.0.1:25565] [--name Player] [--view-distance 8] [--no-vsync] [--no-noclip]` opens a window and renders the world.
 //! It asks to become a spectator on join so the camera can fly through blocks (needs operator rights on the server).
 //! `--headless [--say "hi"] [--for 30] [--greet]` runs without a window; stdin lines are sent as chat.
 
@@ -47,7 +47,7 @@ fn run() -> Result<()> {
     let models = Arc::new(assets.join().expect("asset thread panicked").context("loading block models")?);
     println!("assets ready after {:?} ({} block states)", started.elapsed(), models.states.len());
 
-    let view_distance: u8 = arg(&args, "--view-distance").and_then(|s| s.parse().ok()).unwrap_or(32).clamp(2, 64);
+    let view_distance: u8 = arg(&args, "--view-distance").and_then(|s| s.parse().ok()).unwrap_or(8).clamp(2, 64);
     let (net_tx, net_rx) = std::sync::mpsc::channel();
     {
         let (tx, block_states) = (tx.clone(), models.states.len());
