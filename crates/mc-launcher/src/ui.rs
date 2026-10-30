@@ -1,6 +1,6 @@
-//! The launcher window: sidebar, play screen with animated voxel backdrop, versions, account, settings.
+//! The launcher window: sidebar, play screen with animated voxel backdrop, account, settings.
 
-use crate::install::{self, Paths, Prepared, Progress};
+use crate::install::{self, Paths, Prepared, Progress, VERSION};
 use crate::launch::{self, Account, valid_name};
 use crate::meta::Manifest;
 use crate::settings::Settings;
@@ -16,7 +16,6 @@ use std::time::{Duration, Instant};
 #[derive(PartialEq, Clone, Copy)]
 enum Page {
     Play,
-    Versions,
     Account,
     Settings,
 }
@@ -88,20 +87,13 @@ impl App {
         });
     }
 
-    fn selected_id(&self) -> String {
-        if !self.settings.selected.is_empty() {
-            return self.settings.selected.clone();
-        }
-        self.manifest.as_ref().map(|m| m.latest.release.clone()).unwrap_or_else(|| "26.3".into())
-    }
-
-    /// Installs the selected version, then launches the Rust client (`rust`) or the Java game.
+    /// Installs 26.3, then launches the Rust client (`rust`) or the Java game.
     fn start_play(&mut self, ctx: &Context, rust: bool) {
         if !valid_name(&self.settings.username) {
             self.page = Page::Account;
             return;
         }
-        let id = self.selected_id();
+        let id = VERSION.to_string();
         self.progress.cancel.store(false, Relaxed);
         self.progress.reset_counts();
         self.progress.set_stage("Starting");
@@ -212,7 +204,6 @@ impl eframe::App for App {
             .frame(Frame::new().fill(BG))
             .show(ui, |ui| match self.page {
                 Page::Play => self.play_page(ui, &ctx),
-                Page::Versions => self.page_frame(ui, "Versions", |s, ui| s.versions_page(ui)),
                 Page::Account => self.page_frame(ui, "Account", |s, ui| s.account_page(ui)),
                 Page::Settings => self.page_frame(ui, "Settings", |s, ui| s.settings_page(ui)),
             });
@@ -237,7 +228,7 @@ impl App {
             ui.label(bold("mcrs", 21.0, TEXT));
         });
         ui.add_space(22.0);
-        for (page, label) in [(Page::Play, "Play"), (Page::Versions, "Versions"), (Page::Account, "Account"), (Page::Settings, "Settings")] {
+        for (page, label) in [(Page::Play, "Play"),(Page::Account, "Account"), (Page::Settings, "Settings")] {
             if nav_item(ui, label, self.page == page).clicked() {
                 self.page = page;
             }
@@ -296,31 +287,16 @@ impl App {
 
         let inner = Rect::from_min_size(rect.min + vec2(56.0, 56.0), vec2((rect.width() - 112.0).max(320.0), rect.height() - 112.0));
         ui.scope_builder(UiBuilder::new().max_rect(inner), |ui| {
-            let id = self.selected_id();
-            let kind = self
-                .manifest
-                .as_ref()
-                .and_then(|m| m.versions.iter().find(|v| v.id == id))
-                .map(|v| v.kind.clone())
-                .unwrap_or_else(|| "release".into());
-            let installed = self.paths.is_installed(&id);
+            let id = VERSION;
+            let installed = self.paths.is_installed(id);
 
             ui.label(text("MINECRAFT  ·  RUST EDITION", 12.5, ACCENT));
             ui.add_space(2.0);
-            ui.label(bold(&id, 84.0, TEXT));
-            ui.horizontal(|ui| {
-                pill(ui, &kind, MUTED);
-                pill(ui, if installed { "Installed" } else { "Not installed" }, if installed { ACCENT } else { MUTED });
-                if let Some(m) = &self.manifest {
-                    if m.latest.release == id {
-                        pill(ui, "Latest", ACCENT);
-                    }
-                }
-            });
+            ui.label(bold(id, 84.0, TEXT));
+            pill(ui, if installed { "Installed" } else { "Not installed" }, if installed { ACCENT } else { MUTED });
             ui.add_space(26.0);
 
-            // The Rust client speaks protocol 777, i.e. 26.3 only.
-            let rust_ready = id == "26.3" && singleplayer::client_exe().is_some();
+            let rust_ready = singleplayer::client_exe().is_some();
             match &self.state {
                 State::Idle | State::Failed(_) => {
                     if rust_ready {
@@ -344,7 +320,7 @@ impl App {
                         if play_button(ui, label, None).clicked() {
                             self.start_play(ctx, false);
                         }
-                        ui.label(text("The Rust client supports 26.3; other versions launch the Java game.", 13.0, MUTED));
+                        ui.label(text("mc-client.exe isn't next to the launcher, so this starts the Java game.", 13.0, MUTED));
                     }
                     if let State::Failed(msg) = &self.state {
                         ui.add_space(6.0);
@@ -489,43 +465,6 @@ impl App {
             ui.label(bold(title, 30.0, TEXT));
             ui.add_space(14.0);
             body(self, ui);
-        });
-    }
-
-    fn versions_page(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.settings.show_snapshots, "Show snapshots");
-            if self.manifest.is_none() {
-                if let Some(e) = &self.manifest_err {
-                    ui.label(text(format!("Couldn't load versions: {e}"), 13.0, DANGER));
-                    if ui.button("Retry").clicked() {
-                        self.manifest_err = None;
-                        self.fetch_manifest(ui.ctx());
-                    }
-                } else {
-                    ui.label(text("Loading versions", 13.0, MUTED));
-                }
-            }
-        });
-        let Some(manifest) = self.manifest.clone() else { return };
-        let selected = self.selected_id();
-        ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for v in manifest.versions.iter().filter(|v| v.kind == "release" || (self.settings.show_snapshots && v.kind == "snapshot")) {
-                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width() - 6.0, 54.0), Sense::click());
-                let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
-                let is_sel = v.id == selected;
-                let p = ui.painter();
-                p.rect_filled(rect, CornerRadius::same(12), CARD.lerp_to_gamma(CARD_HOVER, t));
-                p.rect_stroke(rect, CornerRadius::same(12), Stroke::new(1.0, if is_sel { ACCENT } else { STROKE }), StrokeKind::Inside);
-                p.text(rect.left_center() + vec2(20.0, 0.0), Align2::LEFT_CENTER, &v.id, FontId::new(17.0, theme::bold_family()), TEXT);
-                let date = v.release_time.get(..10).unwrap_or("");
-                p.text(rect.left_center() + vec2(190.0, 0.0), Align2::LEFT_CENTER, format!("{}  ·  {date}", v.kind), FontId::new(13.5, FontFamily::Proportional), MUTED);
-                let (label, col) = if self.paths.is_installed(&v.id) { ("Installed", ACCENT) } else { ("", MUTED) };
-                p.text(rect.right_center() - vec2(20.0, 0.0), Align2::RIGHT_CENTER, if is_sel && label.is_empty() { "Selected" } else { label }, FontId::new(13.5, theme::bold_family()), col);
-                if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                    self.settings.selected = v.id.clone();
-                }
-            }
         });
     }
 

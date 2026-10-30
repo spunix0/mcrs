@@ -5,24 +5,14 @@ use std::collections::HashMap;
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct Manifest {
-    pub latest: Latest,
     pub versions: Vec<ManifestVersion>,
-}
-
-#[derive(Deserialize, Clone, Debug)]
-pub struct Latest {
-    pub release: String,
 }
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct ManifestVersion {
     pub id: String,
-    #[serde(rename = "type")]
-    pub kind: String,
     pub url: String,
     pub sha1: String,
-    #[serde(rename = "releaseTime")]
-    pub release_time: String,
 }
 
 #[derive(Deserialize, Clone, Debug)]

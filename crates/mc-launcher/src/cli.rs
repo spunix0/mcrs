@@ -1,6 +1,6 @@
-//! Headless mode: `mc-launcher --install <version> [--launch]` downloads (and optionally starts) a version without opening the window.
+//! Headless mode: `mc-launcher --install [--launch]` downloads (and optionally starts) 26.3 without opening the window.
 
-use crate::install::{self, Paths, Progress};
+use crate::install::{self, Paths, Progress, VERSION};
 use crate::launch::{self, Account};
 use crate::settings::Settings;
 use std::sync::Arc;
@@ -9,11 +9,10 @@ use std::time::Duration;
 
 /// Returns true if the arguments asked for headless mode (and it has been handled).
 pub fn run(args: &[String]) -> bool {
-    let Some(pos) = args.iter().position(|a| a == "--install") else { return false };
-    let Some(id) = args.get(pos + 1) else {
-        eprintln!("usage: mc-launcher --install <version> [--launch | --singleplayer [--world <folder>] [--accept-eula]]");
-        return true;
-    };
+    if !args.iter().any(|a| a == "--install") {
+        return false;
+    }
+    let id = VERSION;
     let paths = Paths::new();
     let progress = Arc::new(Progress::default());
     let manifest = match install::fetch_manifest() {

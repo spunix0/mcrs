@@ -5,10 +5,8 @@ use std::path::Path;
 #[serde(default)]
 pub struct Settings {
     pub username: String,
-    pub selected: String,
     pub memory_mb: u32,
     pub java_override: String,
-    pub show_snapshots: bool,
     /// The user ticked "I accept the Minecraft EULA" (needed to run the world server).
     pub eula_accepted: bool,
     /// Singleplayer world folder name under `worlds/`.
@@ -19,10 +17,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             username: "Player".into(),
-            selected: String::new(),
             memory_mb: 4096,
             java_override: String::new(),
-            show_snapshots: false,
             eula_accepted: false,
             world: "world".into(),
         }
