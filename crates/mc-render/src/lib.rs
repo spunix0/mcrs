@@ -4,7 +4,7 @@ mod gui;
 mod mesh;
 
 pub use gui::{Gui, GuiTexture, GuiVertex};
-pub use mesh::{Area, ChunkMesh, Vertex, mesh_chunk};
+pub use mesh::{Area, ChunkMesh, ChunkVertex, Vertex, brightness, lightmap, mesh_chunk};
 
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
@@ -14,16 +14,51 @@ use std::collections::HashMap;
 use wgpu::util::DeviceExt;
 
 const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-pub const SKY: [f32; 3] = [0.62, 0.76, 1.0];
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Uniforms {
     view_proj: [[f32; 4]; 4],
+    inv_view_proj: [[f32; 4]; 4],
     camera: [f32; 4],
     sky: [f32; 4],
+    fog: [f32; 4],
+    sun: [f32; 4],
+    sunrise: [f32; 4],
     /// xy = window size in pixels.
     screen: [f32; 4],
+    sky_light: [f32; 4],
+    ambient: [f32; 4],
+    block_tint: [f32; 4],
+}
+
+/// Sky and light for this frame (see `sky.rs` in the client for how vanilla computes them).
+#[derive(Clone, Copy, Debug)]
+pub struct Environment {
+    /// Sky color overhead (sRGB 0..1).
+    pub sky: [f32; 3],
+    /// Fog and horizon color; distant chunks fade into it.
+    pub fog: [f32; 3],
+    /// Multiplier on sky light, 0.2 at midnight to 1 at noon.
+    pub daylight: f32,
+    /// Direction to the sun.
+    pub sun: [f32; 3],
+    /// Sunrise/sunset glow color and strength.
+    pub sunrise: [f32; 4],
+    /// The Brightness option, 0 (Moody) .. 1 (Bright).
+    pub gamma: f32,
+    /// Lightmap inputs (26.3 environment attributes): sky light color, ambient light, block light tint.
+    pub sky_light: [f32; 3],
+    pub ambient: [f32; 3],
+    pub block_tint: [f32; 3],
+    /// Fog start and end in blocks when they differ from the render distance (underwater, in lava).
+    pub fog_range: Option<[f32; 2]>,
+}
+
+impl Default for Environment {
+    fn default() -> Self {
+        Self { sky: [0.47, 0.65, 1.0], fog: [0.75, 0.85, 1.0], daylight: 1.0, sun: [0.0, 1.0, 0.0], sunrise: [0.0; 4], gamma: 0.5, sky_light: [1.0; 3], ambient: [0.04; 3], block_tint: [1.0, 0.85, 0.55], fog_range: None }
+    }
 }
 
 struct GpuMesh {
@@ -59,26 +94,26 @@ pub struct LineVertex {
     pub color: [u8; 4],
 }
 
-const MAX_LINE_VERTICES: u64 = 8192;
-const MAX_GUI_VERTICES: u64 = 65536;
-
-/// Lines drawn after the world: `world` is depth-tested (outlines), `top` is drawn over everything (crosshair).
+/// Per-frame geometry besides the chunks. All triangle lists are in world space, 3 vertices per triangle.
 #[derive(Default)]
 pub struct Overlay {
+    /// Depth-tested lines (block outline, hitboxes, chunk borders).
     pub world: Vec<LineVertex>,
+    /// Lines drawn over everything.
     pub top: Vec<LineVertex>,
-    /// Blended, depth-tested triangles in world space (block cracks), 3 vertices each.
+    /// Blended, depth-tested triangles textured from the block atlas (cracks, particles).
     pub quads: Vec<Vertex>,
-    /// Entity triangles in world space, textured from the GUI atlas (skins, white for plain boxes).
+    /// Entity triangles textured from the GUI atlas (skins, white for plain boxes).
     pub entities: Vec<Vertex>,
-    /// First-person arm triangles, textured from the GUI atlas (player skin), in world space.
+    /// Entity triangles textured from the block atlas (dropped items, falling blocks).
+    pub entity_items: Vec<Vertex>,
+    /// Sun, moon and stars, textured from the GUI atlas and added onto the sky.
+    pub celestial: Vec<Vertex>,
+    /// First-person arm triangles, textured from the GUI atlas (player skin).
     pub hand_skin: Vec<Vertex>,
     /// First-person held item triangles, textured from the block/item atlas.
     pub hand_item: Vec<Vertex>,
 }
-
-const MAX_OVERLAY_VERTICES: u64 = 4096;
-const MAX_ENTITY_VERTICES: u64 = 131072;
 
 pub struct FrameStats {
     pub drawn: usize,
@@ -86,6 +121,40 @@ pub struct FrameStats {
     pub triangles: u64,
     /// Vertex + index buffer bytes for all loaded chunks.
     pub gpu_bytes: u64,
+}
+
+/// A vertex buffer that grows to fit what's written to it.
+struct DynBuffer {
+    buffer: wgpu::Buffer,
+    label: &'static str,
+}
+
+impl DynBuffer {
+    fn new(device: &wgpu::Device, label: &'static str, size: u64) -> Self {
+        Self { buffer: Self::make(device, label, size), label }
+    }
+
+    fn make(device: &wgpu::Device, label: &'static str, size: u64) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: size.max(256),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// Uploads `data` and returns how many elements it holds.
+    fn write<T: Pod>(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: &[T]) -> u32 {
+        let bytes: &[u8] = bytemuck::cast_slice(data);
+        if bytes.is_empty() {
+            return 0;
+        }
+        if bytes.len() as u64 > self.buffer.size() {
+            self.buffer = Self::make(device, self.label, (bytes.len() as u64).next_power_of_two());
+        }
+        queue.write_buffer(&self.buffer, 0, bytes);
+        data.len() as u32
+    }
 }
 
 pub struct Renderer {
@@ -96,21 +165,32 @@ pub struct Renderer {
     depth: wgpu::TextureView,
     opaque: wgpu::RenderPipeline,
     translucent: wgpu::RenderPipeline,
+    overlay_pipeline: wgpu::RenderPipeline,
+    cutout: wgpu::RenderPipeline,
+    hand: wgpu::RenderPipeline,
+    sky_pipeline: wgpu::RenderPipeline,
+    celestial_pipeline: wgpu::RenderPipeline,
     lines_world: wgpu::RenderPipeline,
     lines_top: wgpu::RenderPipeline,
-    line_buffer: wgpu::Buffer,
     gui_pipeline: wgpu::RenderPipeline,
-    gui_bind_group: wgpu::BindGroup,
-    gui_buffer: wgpu::Buffer,
-    overlay_buffer: wgpu::Buffer,
-    hand_pipeline: wgpu::RenderPipeline,
-    hand_buffer: wgpu::Buffer,
-    entity_buffer: wgpu::Buffer,
-    uniforms: wgpu::Buffer,
+    gui_blur_pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
+    gui_bind_group: wgpu::BindGroup,
+    panorama_bind_group: wgpu::BindGroup,
+    uniforms: wgpu::Buffer,
+    lines: DynBuffer,
+    gui_buffer: DynBuffer,
+    overlay_buffer: DynBuffer,
+    hand_buffer: DynBuffer,
+    entity_buffer: DynBuffer,
+    entity_item_buffer: DynBuffer,
+    celestial_buffer: DynBuffer,
     chunks: HashMap<(i32, i32), GpuChunk>,
     gpu_bytes: u64,
     pub adapter_name: String,
+    block_texture: wgpu::Texture,
+    /// Frame each animated texture shows now.
+    anim_frames: Vec<usize>,
 }
 
 fn depth_view(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
@@ -157,6 +237,27 @@ fn visible(m: &Mat4, min: Vec3, max: Vec3) -> bool {
     })
 }
 
+/// A texture with all its mip levels (base first), RGBA8 sRGB.
+fn texture(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, w: u32, h: u32, levels: &[&[u8]]) -> wgpu::Texture {
+    let texels: Vec<u8> = levels.concat();
+    device
+        .create_texture_with_data(
+            queue,
+            &wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: levels.len() as u32,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &texels,
+        )
+}
+
 impl Renderer {
     pub fn new(target: impl Into<wgpu::SurfaceTarget<'static>>, width: u32, height: u32, atlas: &Atlas, gui_atlas: &GuiAtlas, vsync: bool) -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -178,29 +279,24 @@ impl Renderer {
         config.desired_maximum_frame_latency = 2;
         surface.configure(&device, &config);
 
-        // Base level followed by every mip level, as create_texture_with_data expects for one layer.
-        let mut texels = atlas.rgba.clone();
-        for level in &atlas.mips {
-            texels.extend_from_slice(level);
-        }
-        let texture = device.create_texture_with_data(
-            &queue,
-            &wgpu::TextureDescriptor {
-                label: Some("block atlas"),
-                size: wgpu::Extent3d { width: atlas.width, height: atlas.height, depth_or_array_layers: 1 },
-                mip_level_count: 1 + atlas.mips.len() as u32,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            },
-            wgpu::util::TextureDataOrder::LayerMajor,
-            &texels,
-        );
+        let mut levels: Vec<&[u8]> = vec![&atlas.rgba];
+        levels.extend(atlas.mips.iter().map(Vec::as_slice));
+        let block_texture = texture(&device, &queue, "block atlas", atlas.width, atlas.height, &levels);
+        let block_view = block_texture.create_view(&Default::default());
+        let gui_view = texture(&device, &queue, "gui atlas", gui_atlas.width, gui_atlas.height, &[&gui_atlas.rgba]).create_view(&Default::default());
+        let panorama_view = match &gui_atlas.panorama {
+            Some(p) => texture(&device, &queue, "panorama", p.width, p.height, &p.levels.iter().map(Vec::as_slice).collect::<Vec<_>>()).create_view(&Default::default()),
+            None => texture(&device, &queue, "panorama", 1, 1, &[&[40, 40, 40, 255]]).create_view(&Default::default()),
+        };
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        let smooth = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
@@ -237,15 +333,21 @@ impl Renderer {
                 },
             ],
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&texture.create_view(&Default::default())) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
-            ],
-        });
+        let group = |label: &str, view: &wgpu::TextureView, sampler: &wgpu::Sampler| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(view) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+                ],
+            })
+        };
+        let bind_group = group("blocks", &block_view, &sampler);
+        let gui_bind_group = group("gui", &gui_view, &sampler);
+        let panorama_bind_group = group("panorama", &panorama_view, &smooth);
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("blocks"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -260,27 +362,48 @@ impl Renderer {
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Unorm8x4],
         };
-        let make = |fs: &str, blend: Option<wgpu::BlendState>, depth_write: bool, cull: Option<wgpu::Face>| {
+        let chunk_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<ChunkVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Unorm8x4, 3 => Unorm8x4],
+        };
+        let additive = wgpu::BlendState {
+            color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
+            alpha: wgpu::BlendComponent::OVER,
+        };
+        struct P<'a> {
+            label: &'a str,
+            vs: &'a str,
+            fs: &'a str,
+            buffers: Option<wgpu::VertexBufferLayout<'a>>,
+            topology: wgpu::PrimitiveTopology,
+            blend: Option<wgpu::BlendState>,
+            depth_write: bool,
+            compare: wgpu::CompareFunction,
+            cull: Option<wgpu::Face>,
+        }
+        let make = |p: P| {
+            let buffers = [p.buffers];
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(fs),
+                label: Some(p.label),
                 layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
-                    entry_point: Some("vs"),
+                    entry_point: Some(p.vs),
                     compilation_options: Default::default(),
-                    buffers: &[Some(vertex_layout.clone())],
+                    buffers: if buffers[0].is_some() { &buffers } else { &[] },
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some(fs),
+                    entry_point: Some(p.fs),
                     compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState { format, blend, write_mask: wgpu::ColorWrites::ALL })],
+                    targets: &[Some(wgpu::ColorTargetState { format, blend: p.blend, write_mask: wgpu::ColorWrites::ALL })],
                 }),
-                primitive: wgpu::PrimitiveState { cull_mode: cull, ..Default::default() },
+                primitive: wgpu::PrimitiveState { topology: p.topology, cull_mode: p.cull, ..Default::default() },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH,
-                    depth_write_enabled: Some(depth_write),
-                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    depth_write_enabled: Some(p.depth_write),
+                    depth_compare: Some(p.compare),
                     stencil: Default::default(),
                     bias: Default::default(),
                 }),
@@ -289,135 +412,48 @@ impl Renderer {
                 cache: None,
             })
         };
-        let opaque = make("fs_opaque", None, true, Some(wgpu::Face::Back));
-        let translucent = make("fs_translucent", Some(wgpu::BlendState::ALPHA_BLENDING), false, None);
+        let tri = wgpu::PrimitiveTopology::TriangleList;
+        let less = wgpu::CompareFunction::LessEqual;
+        let always = wgpu::CompareFunction::Always;
+        let alpha = Some(wgpu::BlendState::ALPHA_BLENDING);
+        let v = || Some(vertex_layout.clone());
+        let c = || Some(chunk_layout.clone());
+        let opaque = make(P { label: "opaque", vs: "vs_chunk", fs: "fs_opaque", buffers: c(), topology: tri, blend: None, depth_write: true, compare: less, cull: Some(wgpu::Face::Back) });
+        let translucent = make(P { label: "translucent", vs: "vs_chunk", fs: "fs_translucent", buffers: c(), topology: tri, blend: alpha, depth_write: false, compare: less, cull: Some(wgpu::Face::Back) });
+        let overlay_pipeline = make(P { label: "overlay", vs: "vs", fs: "fs_translucent", buffers: v(), topology: tri, blend: alpha, depth_write: false, compare: less, cull: None });
+        // Entities, dropped items and the hand: alpha-tested, both sides.
+        let cutout = make(P { label: "cutout", vs: "vs", fs: "fs_cutout", buffers: v(), topology: tri, blend: None, depth_write: true, compare: less, cull: None });
+        let hand = make(P { label: "hand", vs: "vs", fs: "fs_hand", buffers: v(), topology: tri, blend: None, depth_write: true, compare: less, cull: None });
+        let sky_pipeline = make(P { label: "sky", vs: "vs_sky", fs: "fs_sky", buffers: None, topology: tri, blend: None, depth_write: false, compare: always, cull: None });
+        let celestial_pipeline = make(P { label: "celestial", vs: "vs", fs: "fs_celestial", buffers: v(), topology: tri, blend: Some(additive), depth_write: false, compare: always, cull: None });
 
         let line_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<LineVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Unorm8x4],
         };
-        let make_lines = |label: &str, compare: wgpu::CompareFunction| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_line"),
-                    compilation_options: Default::default(),
-                    buffers: &[Some(line_layout.clone())],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_line"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::LineList, ..Default::default() },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH,
-                    depth_write_enabled: Some(false),
-                    depth_compare: Some(compare),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: Default::default(),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let gui_texture = device.create_texture_with_data(
-            &queue,
-            &wgpu::TextureDescriptor {
-                label: Some("gui atlas"),
-                size: wgpu::Extent3d { width: gui_atlas.width, height: gui_atlas.height, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            },
-            wgpu::util::TextureDataOrder::LayerMajor,
-            &gui_atlas.rgba,
-        );
-        let gui_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("gui"),
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&gui_texture.create_view(&Default::default())) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
-            ],
-        });
+        let lines = wgpu::PrimitiveTopology::LineList;
+        let lines_world = make(P { label: "outline", vs: "vs_line", fs: "fs_line", buffers: Some(line_layout.clone()), topology: lines, blend: alpha, depth_write: false, compare: less, cull: None });
+        let lines_top = make(P { label: "crosshair", vs: "vs_line", fs: "fs_line", buffers: Some(line_layout), topology: lines, blend: alpha, depth_write: false, compare: always, cull: None });
+
         let gui_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<GuiVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Unorm8x4],
         };
-        let gui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("gui"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_gui"), compilation_options: Default::default(), buffers: &[Some(gui_layout)] },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_gui"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
-            }),
-            primitive: Default::default(),
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Always),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-        let gui_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("gui vertices"),
-            size: MAX_GUI_VERTICES * std::mem::size_of::<GuiVertex>() as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        // The hand is drawn like opaque blocks (alpha-tested), both sides, in its own depth buffer.
-        let hand_pipeline = make("fs_opaque", None, true, None);
-        let hand_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("hand"),
-            size: MAX_OVERLAY_VERTICES * std::mem::size_of::<Vertex>() as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let entity_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("entities"),
-            size: MAX_ENTITY_VERTICES * std::mem::size_of::<Vertex>() as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let overlay_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("overlay quads"),
-            size: MAX_OVERLAY_VERTICES * std::mem::size_of::<Vertex>() as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let lines_world = make_lines("outline", wgpu::CompareFunction::LessEqual);
-        let lines_top = make_lines("crosshair", wgpu::CompareFunction::Always);
-        let line_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("lines"),
-            size: MAX_LINE_VERTICES * std::mem::size_of::<LineVertex>() as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let depth = depth_view(&device, config.width, config.height);
+        let gui_pipeline = make(P { label: "gui", vs: "vs_gui", fs: "fs_gui", buffers: Some(gui_layout.clone()), topology: tri, blend: alpha, depth_write: false, compare: always, cull: None });
+        let gui_blur_pipeline = make(P { label: "gui blur", vs: "vs_gui", fs: "fs_gui_blur", buffers: Some(gui_layout), topology: tri, blend: alpha, depth_write: false, compare: always, cull: None });
 
+        let depth = depth_view(&device, config.width, config.height);
+        let buf = |label| DynBuffer::new(&device, label, 1 << 16);
         Ok(Self {
+            lines: buf("lines"),
+            gui_buffer: buf("gui vertices"),
+            overlay_buffer: buf("overlay quads"),
+            hand_buffer: buf("hand"),
+            entity_buffer: buf("entities"),
+            entity_item_buffer: buf("entity items"),
+            celestial_buffer: buf("celestial"),
             surface,
             device,
             queue,
@@ -425,21 +461,24 @@ impl Renderer {
             depth,
             opaque,
             translucent,
+            overlay_pipeline,
+            cutout,
+            hand,
+            sky_pipeline,
+            celestial_pipeline,
             lines_world,
             lines_top,
-            line_buffer,
             gui_pipeline,
-            gui_bind_group,
-            gui_buffer,
-            overlay_buffer,
-            hand_pipeline,
-            hand_buffer,
-            entity_buffer,
-            uniforms,
+            gui_blur_pipeline,
             bind_group,
+            gui_bind_group,
+            panorama_bind_group,
+            uniforms,
             chunks: HashMap::new(),
             gpu_bytes: 0,
             adapter_name,
+            anim_frames: vec![0; atlas.animations.len()],
+            block_texture,
         })
     }
 
@@ -451,6 +490,11 @@ impl Renderer {
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.depth = depth_view(&self.device, width, height);
+    }
+
+    pub fn set_vsync(&mut self, vsync: bool) {
+        self.config.present_mode = if vsync { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::AutoNoVsync };
+        self.surface.configure(&self.device, &self.config);
     }
 
     pub fn aspect(&self) -> f32 {
@@ -480,7 +524,14 @@ impl Renderer {
         }
     }
 
-    pub fn render(&mut self, view_proj: Mat4, camera: Vec3, fog_end: f32, overlay: &Overlay, gui: &Gui) -> FrameStats {
+    /// Drops every chunk mesh (leaving a world or changing dimension).
+    pub fn clear_chunks(&mut self) {
+        self.chunks.clear();
+        self.gpu_bytes = 0;
+    }
+
+    /// Draws one frame. Without `world` only the GUI is drawn (menus outside a world).
+    pub fn render(&mut self, view_proj: Mat4, camera: Vec3, fog_end: f32, env: &Environment, overlay: &Overlay, gui: &Gui, world: bool) -> FrameStats {
         let mut stats = FrameStats { drawn: 0, loaded: self.chunks.len(), triangles: 0, gpu_bytes: self.gpu_bytes };
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -491,46 +542,45 @@ impl Renderer {
             _ => return stats,
         };
         let view = frame.texture.create_view(&Default::default());
+        let rgb = |c: [f32; 3], w: f32| [c[0], c[1], c[2], w];
         let u = Uniforms {
             view_proj: view_proj.to_cols_array_2d(),
-            camera: [camera.x, camera.y, camera.z, fog_end],
-            sky: [SKY[0], SKY[1], SKY[2], 1.0],
+            inv_view_proj: view_proj.inverse().to_cols_array_2d(),
+            camera: [camera.x, camera.y, camera.z, env.fog_range.map_or(fog_end, |r| r[1])],
+            sky: rgb(env.sky, env.fog_range.map_or(fog_end * 0.7, |r| r[0])),
+            fog: rgb(env.fog, env.daylight),
+            sun: rgb(env.sun, env.sunrise[3]),
+            sunrise: [env.sunrise[0], env.sunrise[1], env.sunrise[2], env.gamma],
             screen: [self.config.width as f32, self.config.height as f32, 0.0, 0.0],
+            sky_light: rgb(env.sky_light, 1.0),
+            ambient: rgb(env.ambient, 1.0),
+            block_tint: rgb(env.block_tint, 1.0),
         };
         self.queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
+        let (device, queue) = (&self.device, &self.queue);
         let mut lines = overlay.world.clone();
         lines.extend_from_slice(&overlay.top);
-        lines.truncate(MAX_LINE_VERTICES as usize);
-        let (world_lines, line_count) = (overlay.world.len().min(lines.len()) as u32, lines.len() as u32);
-        if line_count > 0 {
-            self.queue.write_buffer(&self.line_buffer, 0, bytemuck::cast_slice(&lines));
-        }
-        let entity_count = overlay.entities.len().min(MAX_ENTITY_VERTICES as usize) / 3 * 3;
-        if entity_count > 0 {
-            self.queue.write_buffer(&self.entity_buffer, 0, bytemuck::cast_slice(&overlay.entities[..entity_count]));
-        }
-        let quad_count = overlay.quads.len().min(MAX_OVERLAY_VERTICES as usize) / 3 * 3;
-        if quad_count > 0 {
-            self.queue.write_buffer(&self.overlay_buffer, 0, bytemuck::cast_slice(&overlay.quads[..quad_count]));
-        }
+        let world_lines = overlay.world.len() as u32;
+        let line_count = self.lines.write(device, queue, &lines);
+        let entity_count = self.entity_buffer.write(device, queue, &overlay.entities[..overlay.entities.len() / 3 * 3]);
+        let item_count = self.entity_item_buffer.write(device, queue, &overlay.entity_items[..overlay.entity_items.len() / 3 * 3]);
+        let quad_count = self.overlay_buffer.write(device, queue, &overlay.quads[..overlay.quads.len() / 3 * 3]);
+        let celestial_count = self.celestial_buffer.write(device, queue, &overlay.celestial[..overlay.celestial.len() / 3 * 3]);
         let mut hand = overlay.hand_skin.clone();
         hand.extend_from_slice(&overlay.hand_item);
-        hand.truncate(MAX_OVERLAY_VERTICES as usize);
-        let (skin_count, hand_count) = (overlay.hand_skin.len().min(hand.len()) as u32, hand.len() as u32);
-        if hand_count > 0 {
-            self.queue.write_buffer(&self.hand_buffer, 0, bytemuck::cast_slice(&hand));
-        }
-        let gui_count = gui.vertices.len().min(MAX_GUI_VERTICES as usize);
-        if gui_count > 0 {
-            self.queue.write_buffer(&self.gui_buffer, 0, bytemuck::cast_slice(&gui.vertices[..gui_count]));
-        }
+        let skin_count = overlay.hand_skin.len() as u32;
+        let hand_count = self.hand_buffer.write(device, queue, &hand);
+        let gui_count = self.gui_buffer.write(device, queue, &gui.vertices);
 
-        let mut visible_chunks: Vec<(&GpuChunk, f32)> = self
-            .chunks
-            .values()
-            .filter(|c| c.min.y <= c.max.y && visible(&view_proj, c.min, c.max))
-            .map(|c| (c, ((c.min + c.max) * 0.5).distance_squared(camera)))
-            .collect();
+        let mut visible_chunks: Vec<(&GpuChunk, f32)> = if world {
+            self.chunks
+                .values()
+                .filter(|c| c.min.y <= c.max.y && visible(&view_proj, c.min, c.max))
+                .map(|c| (c, ((c.min + c.max) * 0.5).distance_squared(camera)))
+                .collect()
+        } else {
+            Vec::new()
+        };
         stats.drawn = visible_chunks.len();
         stats.triangles = visible_chunks
             .iter()
@@ -540,6 +590,9 @@ impl Renderer {
         visible_chunks.sort_by(|a, b| a.1.total_cmp(&b.1));
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
+        let clear = if world { env.fog } else { [0.0; 3] };
+        // The surface is sRGB: clear with the linear value of the fog color.
+        let lin = |c: f32| (c as f64).powf(2.2);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("world"),
@@ -548,7 +601,7 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: SKY[0] as f64, g: SKY[1] as f64, b: SKY[2] as f64, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: lin(clear[0]), g: lin(clear[1]), b: lin(clear[2]), a: 1.0 }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -561,41 +614,55 @@ impl Renderer {
                 timestamp_writes: None,
                 multiview_mask: None,
             });
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.set_pipeline(&self.opaque);
-            for (c, _) in &visible_chunks {
-                if let Some(m) = &c.opaque {
-                    pass.set_vertex_buffer(0, m.vertices.slice(..));
-                    pass.set_index_buffer(m.indices.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..m.count, 0, 0..1);
-                }
-            }
-            if entity_count > 0 {
-                pass.set_pipeline(&self.hand_pipeline);
+            if world {
                 pass.set_bind_group(0, &self.gui_bind_group, &[]);
-                pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
-                pass.draw(0..entity_count as u32, 0..1);
-                pass.set_bind_group(0, &self.bind_group, &[]);
-            }
-            pass.set_pipeline(&self.translucent);
-            for (c, _) in visible_chunks.iter().rev() {
-                if let Some(m) = &c.translucent {
-                    pass.set_vertex_buffer(0, m.vertices.slice(..));
-                    pass.set_index_buffer(m.indices.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..m.count, 0, 0..1);
+                pass.set_pipeline(&self.sky_pipeline);
+                pass.draw(0..3, 0..1);
+                if celestial_count > 0 {
+                    pass.set_pipeline(&self.celestial_pipeline);
+                    pass.set_vertex_buffer(0, self.celestial_buffer.buffer.slice(..));
+                    pass.draw(0..celestial_count, 0..1);
                 }
-            }
-            if quad_count > 0 {
-                // Still on the translucent pipeline and block atlas from the pass above.
-                pass.set_vertex_buffer(0, self.overlay_buffer.slice(..));
-                pass.draw(0..quad_count as u32, 0..1);
-            }
-            if line_count > 0 {
-                pass.set_vertex_buffer(0, self.line_buffer.slice(..));
-                pass.set_pipeline(&self.lines_world);
-                pass.draw(0..world_lines, 0..1);
-                pass.set_pipeline(&self.lines_top);
-                pass.draw(world_lines..line_count, 0..1);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_pipeline(&self.opaque);
+                for (c, _) in &visible_chunks {
+                    if let Some(m) = &c.opaque {
+                        pass.set_vertex_buffer(0, m.vertices.slice(..));
+                        pass.set_index_buffer(m.indices.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..m.count, 0, 0..1);
+                    }
+                }
+                pass.set_pipeline(&self.cutout);
+                if item_count > 0 {
+                    pass.set_vertex_buffer(0, self.entity_item_buffer.buffer.slice(..));
+                    pass.draw(0..item_count, 0..1);
+                }
+                if entity_count > 0 {
+                    pass.set_bind_group(0, &self.gui_bind_group, &[]);
+                    pass.set_vertex_buffer(0, self.entity_buffer.buffer.slice(..));
+                    pass.draw(0..entity_count, 0..1);
+                    pass.set_bind_group(0, &self.bind_group, &[]);
+                }
+                pass.set_pipeline(&self.translucent);
+                for (c, _) in visible_chunks.iter().rev() {
+                    if let Some(m) = &c.translucent {
+                        pass.set_vertex_buffer(0, m.vertices.slice(..));
+                        pass.set_index_buffer(m.indices.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..m.count, 0, 0..1);
+                    }
+                }
+                if quad_count > 0 {
+                    pass.set_pipeline(&self.overlay_pipeline);
+                    pass.set_vertex_buffer(0, self.overlay_buffer.buffer.slice(..));
+                    pass.draw(0..quad_count, 0..1);
+                }
+                if line_count > 0 {
+                    pass.set_vertex_buffer(0, self.lines.buffer.slice(..));
+                    pass.set_pipeline(&self.lines_world);
+                    pass.draw(0..world_lines, 0..1);
+                    pass.set_pipeline(&self.lines_top);
+                    pass.draw(world_lines..line_count, 0..1);
+                }
             }
         }
         {
@@ -617,9 +684,9 @@ impl Renderer {
                 timestamp_writes: None,
                 multiview_mask: None,
             });
-            if hand_count > 0 {
-                pass.set_pipeline(&self.hand_pipeline);
-                pass.set_vertex_buffer(0, self.hand_buffer.slice(..));
+            if world && hand_count > 0 {
+                pass.set_pipeline(&self.hand);
+                pass.set_vertex_buffer(0, self.hand_buffer.buffer.slice(..));
                 if skin_count > 0 {
                     pass.set_bind_group(0, &self.gui_bind_group, &[]);
                     pass.draw(0..skin_count, 0..1);
@@ -630,20 +697,65 @@ impl Renderer {
                 }
             }
             if gui_count > 0 {
-                pass.set_pipeline(&self.gui_pipeline);
-                pass.set_vertex_buffer(0, self.gui_buffer.slice(..));
-                for &(texture, start, end) in &gui.batches {
-                    let end = end.min(gui_count as u32);
-                    if start >= end {
+                pass.set_vertex_buffer(0, self.gui_buffer.buffer.slice(..));
+                let (sw, sh) = (self.config.width, self.config.height);
+                for b in &gui.batches {
+                    let end = b.end.min(gui_count);
+                    if b.start >= end {
                         continue;
                     }
-                    pass.set_bind_group(0, if texture == GuiTexture::Blocks { &self.bind_group } else { &self.gui_bind_group }, &[]);
-                    pass.draw(start..end, 0..1);
+                    match b.clip {
+                        Some([x, y, w, h]) => {
+                            let (x, y) = (x.min(sw), y.min(sh));
+                            let (w, h) = (w.min(sw - x), h.min(sh - y));
+                            if w == 0 || h == 0 {
+                                continue;
+                            }
+                            pass.set_scissor_rect(x, y, w, h);
+                        }
+                        None => pass.set_scissor_rect(0, 0, sw, sh),
+                    }
+                    let (pipeline, group) = match b.texture {
+                        GuiTexture::Gui => (&self.gui_pipeline, &self.gui_bind_group),
+                        GuiTexture::Blocks => (&self.gui_pipeline, &self.bind_group),
+                        GuiTexture::Panorama => (&self.gui_pipeline, &self.panorama_bind_group),
+                        GuiTexture::PanoramaBlur => (&self.gui_blur_pipeline, &self.panorama_bind_group),
+                    };
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, group, &[]);
+                    pass.draw(b.start..end, 0..1);
                 }
             }
         }
         self.queue.submit([encoder.finish()]);
         self.queue.present(frame);
         stats
+    }
+}
+
+impl Renderer {
+    /// Shows the frame each animated block texture (water, lava, fire, ...) has at game tick `tick`.
+    pub fn animate(&mut self, atlas: &Atlas, tick: u64) {
+        for (i, a) in atlas.animations.iter().enumerate() {
+            let f = a.frame_at(tick);
+            if self.anim_frames.get(i) == Some(&f) {
+                continue;
+            }
+            self.anim_frames[i] = f;
+            for (level, px) in a.frames[f].iter().enumerate() {
+                let size = (16u32 >> level).max(1);
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &self.block_texture,
+                        mip_level: level as u32,
+                        origin: wgpu::Origin3d { x: a.x >> level, y: a.y >> level, z: 0 },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    px,
+                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size * 4), rows_per_image: Some(size) },
+                    wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+                );
+            }
+        }
     }
 }

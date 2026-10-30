@@ -53,7 +53,7 @@ fn flatten(args: &[Arg]) -> Vec<String> {
     out
 }
 
-pub fn launch(paths: &Paths, prepared: &Prepared, account: &Account, memory_mb: u32, java_override: Option<&str>) -> Result<Child> {
+pub fn launch(paths: &Paths, prepared: &Prepared, account: &Account, memory_mb: u32, java_override: Option<&str>, extra: &[String]) -> Result<Child> {
     let v = &prepared.version;
     let game_dir = paths.game();
     let natives = paths.natives(&v.id);
@@ -96,6 +96,7 @@ pub fn launch(paths: &Paths, prepared: &Prepared, account: &Account, memory_mb: 
     }
     args.push(v.main_class.clone());
     args.extend(flatten(&v.arguments.game).iter().map(|a| expand(a, &vars)));
+    args.extend_from_slice(extra);
 
     let java = java_override
         .filter(|s| !s.trim().is_empty())

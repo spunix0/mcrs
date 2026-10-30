@@ -4,6 +4,17 @@ pub mod handshake {
     pub const INTENTION: i32 = 0;
 }
 
+pub mod status {
+    pub mod c2s {
+        pub const STATUS_REQUEST: i32 = 0;
+        pub const PING_REQUEST: i32 = 1;
+    }
+    pub mod s2c {
+        pub const STATUS_RESPONSE: i32 = 0;
+        pub const PONG_RESPONSE: i32 = 1;
+    }
+}
+
 pub mod login {
     pub mod c2s {
         pub const HELLO: i32 = 0;
@@ -58,6 +69,12 @@ pub mod play {
         pub const SET_CARRIED_ITEM: i32 = 54;
         pub const USE_ITEM_ON: i32 = 66;
         pub const USE_ITEM: i32 = 67;
+        pub const CONTAINER_CLICK: i32 = 18;
+        pub const PLAYER_COMMAND: i32 = 42;
+        pub const PUNCH: i32 = 46;
+        pub const CLIENT_INFORMATION: i32 = 14;
+        pub const PICK_ITEM_FROM_BLOCK: i32 = 36;
+        pub const SET_CREATIVE_MODE_SLOT: i32 = 57;
     }
     pub mod s2c {
         pub const ADD_ENTITY: i32 = 1;
@@ -93,5 +110,31 @@ pub mod play {
         pub const SYSTEM_CHAT: i32 = 124;
         pub const PLAYER_CHAT: i32 = 66;
         pub const DISGUISED_CHAT: i32 = 33;
+        pub const ANIMATE: i32 = 2;
+        pub const BLOCK_DESTRUCTION: i32 = 5;
+        pub const CHANGE_DIFFICULTY: i32 = 10;
+        pub const CLEAR_TITLES: i32 = 14;
+        pub const CONTAINER_CLOSE: i32 = 17;
+        pub const CONTAINER_SET_DATA: i32 = 19;
+        pub const DAMAGE_EVENT: i32 = 25;
+        pub const ENTITY_EVENT: i32 = 34;
+        pub const HURT_ANIMATION: i32 = 43;
+        pub const OPEN_SCREEN: i32 = 60;
+        pub const PLAYER_ABILITIES: i32 = 65;
+        pub const PLAYER_COMBAT_KILL: i32 = 69;
+        pub const PLAYER_INFO_REMOVE: i32 = 70;
+        pub const PLAYER_INFO_UPDATE: i32 = 71;
+        pub const RESPAWN: i32 = 84;
+        pub const SET_ACTION_BAR_TEXT: i32 = 89;
+        pub const SET_CURSOR_ITEM: i32 = 98;
+        pub const SET_ENTITY_DATA: i32 = 101;
+        pub const SET_ENTITY_MOTION: i32 = 103;
+        pub const SET_EXPERIENCE: i32 = 105;
+        pub const SET_SUBTITLE_TEXT: i32 = 114;
+        pub const SET_TIME: i32 = 115;
+        pub const SET_TITLE_TEXT: i32 = 116;
+        pub const SET_TITLES_ANIMATION: i32 = 117;
+        pub const TAB_LIST: i32 = 125;
+        pub const TAKE_ITEM_ENTITY: i32 = 127;
     }
 }

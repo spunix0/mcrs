@@ -25,6 +25,13 @@ pub struct Sender {
 }
 
 impl Sender {
+    /// Closes the connection; the receiving side then fails, ending the session thread.
+    pub fn shutdown(&self) {
+        if let Ok(s) = self.stream.lock() {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
     pub fn send(&self, id: i32, body: &[u8]) -> Result<()> {
         let mut inner = Vec::with_capacity(body.len() + 5);
         write_varint(&mut inner, id);
@@ -113,6 +120,21 @@ impl Receiver {
 pub fn connect(addr: &str) -> Result<(Sender, Receiver)> {
     let stream = TcpStream::connect(addr)?;
     stream.set_nodelay(true)?;
+    let threshold = Arc::new(AtomicI32::new(-1));
+    let sender = Sender { stream: Arc::new(Mutex::new(stream.try_clone()?)), threshold: threshold.clone() };
+    let receiver = Receiver { reader: BufReader::with_capacity(64 * 1024, stream), threshold };
+    Ok((sender, receiver))
+}
+
+/// Like [`connect`], but gives up after `timeout` (for both connecting and every later read).
+/// `addr` may be a host name; port 25565 is used when none is given.
+pub fn connect_timeout(addr: &str, timeout: std::time::Duration) -> Result<(Sender, Receiver)> {
+    use std::net::ToSocketAddrs;
+    let with_port = if addr.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) { addr.to_string() } else { format!("{addr}:25565") };
+    let target = with_port.to_socket_addrs()?.next().ok_or_else(|| bad("unknown host"))?;
+    let stream = TcpStream::connect_timeout(&target, timeout)?;
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(timeout))?;
     let threshold = Arc::new(AtomicI32::new(-1));
     let sender = Sender { stream: Arc::new(Mutex::new(stream.try_clone()?)), threshold: threshold.clone() };
     let receiver = Receiver { reader: BufReader::with_capacity(64 * 1024, stream), threshold };

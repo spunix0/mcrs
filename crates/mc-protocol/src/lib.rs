@@ -3,10 +3,11 @@
 pub mod buf;
 pub mod conn;
 pub mod ids;
+pub mod status;
 pub mod text;
 
 pub use buf::{Reader, Writer};
-pub use conn::{Receiver, Sender, connect};
+pub use conn::{Receiver, Sender, connect, connect_timeout};
 
 pub const PROTOCOL_VERSION: i32 = 777;
 pub const GAME_VERSION: &str = "26.3";

@@ -56,6 +56,10 @@ fn append(tag: &Tag, lang: &dyn Fn(&str) -> Option<String>, out: &mut String) {
         Tag::String(s) => out.push_str(s),
         Tag::List(items) => items.iter().for_each(|t| append(t, lang, out)),
         Tag::Compound(_) => {
+            // Mixed-type NBT lists wrap each element as `{"": value}`.
+            if let Some(inner) = tag.get("") {
+                return append(inner, lang, out);
+            }
             if let Some(s) = tag.get("text").and_then(Tag::as_str) {
                 out.push_str(s);
             } else if let Some(key) = tag.get("translate").and_then(Tag::as_str) {
@@ -70,6 +74,12 @@ fn append(tag: &Tag, lang: &dyn Fn(&str) -> Option<String>, out: &mut String) {
                 extra.iter().for_each(|t| append(t, lang, out));
             }
         }
+        Tag::Byte(v) => out.push_str(&v.to_string()),
+        Tag::Short(v) => out.push_str(&v.to_string()),
+        Tag::Int(v) => out.push_str(&v.to_string()),
+        Tag::Long(v) => out.push_str(&v.to_string()),
+        Tag::Float(v) => out.push_str(&v.to_string()),
+        Tag::Double(v) => out.push_str(&v.to_string()),
         other => out.push_str(&format!("{other:?}")),
     }
 }
@@ -90,6 +100,16 @@ mod tests {
         assert_eq!(plain(&joined()), "multiplayer.player.joined [Player]");
         let lang = |k: &str| (k == "multiplayer.player.joined").then(|| "%s joined the game".to_string());
         assert_eq!(render(&joined(), &lang), "Player joined the game");
+    }
+
+    #[test]
+    fn wrapped_and_numeric_args() {
+        let tag = Tag::Compound(vec![
+            ("translate".into(), Tag::String("k".into())),
+            ("with".into(), Tag::List(vec![Tag::Compound(vec![("".into(), Tag::Int(1))]), Tag::Compound(vec![("".into(), Tag::String("x".into()))])])),
+        ]);
+        let lang = |_: &str| Some("%s and %s".to_string());
+        assert_eq!(render(&tag, &lang), "1 and x");
     }
 
     #[test]

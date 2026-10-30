@@ -14,6 +14,7 @@ pub struct Atlas {
     pub mips: Vec<Vec<u8>>,
     rects: HashMap<String, [f32; 4]>,
     alpha: HashMap<String, (bool, bool)>,
+    pub animations: Vec<Animation>,
 }
 
 fn missing() -> Vec<u8> {
@@ -79,6 +80,74 @@ fn mipmaps(base: &[u8], width: usize, height: usize) -> Vec<Vec<u8>> {
     levels
 }
 
+/// An animated texture (`.png.mcmeta` with `animation`): its tile in the atlas and its frames, each 16x16 RGBA
+/// with its mip levels.
+pub struct Animation {
+    /// Top-left pixel of the tile in the atlas.
+    pub x: u32,
+    pub y: u32,
+    /// Frame images: base level followed by each mip level.
+    pub frames: Vec<Vec<Vec<u8>>>,
+    /// (frame index, ticks it shows), in play order.
+    pub sequence: Vec<(usize, u32)>,
+    pub length: u32,
+}
+
+impl Animation {
+    /// The frame showing at game tick `tick`.
+    pub fn frame_at(&self, tick: u64) -> usize {
+        let mut t = (tick % self.length.max(1) as u64) as u32;
+        for &(f, time) in &self.sequence {
+            if t < time {
+                return f;
+            }
+            t -= time;
+        }
+        0
+    }
+}
+
+/// Splits a vertical frame strip into 16x16 frames (with mips) and reads the frame order from the `.mcmeta`.
+fn load_animation(jar: &mut Jar, name: &str) -> Option<(Vec<Vec<Vec<u8>>>, Vec<(usize, u32)>)> {
+    let path = name.split_once(':').map_or(name, |(_, p)| p);
+    let meta = jar.json(&format!("assets/minecraft/textures/{path}.png.mcmeta"))?;
+    let anim = meta.get("animation")?;
+    let bytes = jar.read(&format!("assets/minecraft/textures/{path}.png"))?;
+    let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png).ok()?.to_rgba8();
+    let side = img.width() as usize;
+    let count = img.height() as usize / side.max(1);
+    if count < 2 {
+        return None;
+    }
+    let frames: Vec<Vec<Vec<u8>>> = (0..count)
+        .map(|f| {
+            let mut px = vec![0u8; TILE * TILE * 4];
+            for y in 0..TILE {
+                for x in 0..TILE {
+                    let p = img.get_pixel((x * side / TILE) as u32, (f * side + y * side / TILE) as u32);
+                    px[(y * TILE + x) * 4..][..4].copy_from_slice(&p.0);
+                }
+            }
+            let mut levels = vec![px.clone()];
+            levels.extend(mipmaps(&px, TILE, TILE));
+            levels
+        })
+        .collect();
+    let default_time = anim["frametime"].as_u64().unwrap_or(1).max(1) as u32;
+    let sequence = match anim["frames"].as_array() {
+        Some(list) => list
+            .iter()
+            .filter_map(|f| match f {
+                serde_json::Value::Number(n) => Some((n.as_u64()? as usize, default_time)),
+                o => Some((o["index"].as_u64()? as usize, o["time"].as_u64().map_or(default_time, |t| t.max(1) as u32))),
+            })
+            .filter(|(i, _)| *i < count)
+            .collect(),
+        None => (0..count).map(|i| (i, default_time)).collect(),
+    };
+    Some((frames, sequence))
+}
+
 impl Atlas {
     pub fn build(jar: &mut Jar, names: &[String]) -> anyhow::Result<Self> {
         let count = names.len() + 1;
@@ -88,11 +157,16 @@ impl Atlas {
         let mut rects = HashMap::new();
         let mut alpha = HashMap::new();
         let inset = 1.0 / 256.0;
+        let mut animations = Vec::new();
 
         let all = std::iter::once("minecraft:missingno".to_string()).chain(names.iter().cloned());
         for (i, name) in all.enumerate() {
             let px = load_tile(jar, &name).unwrap_or_else(missing);
             let (cx, cy) = ((i % COLUMNS) * TILE, (i / COLUMNS) * TILE);
+            if let Some((frames, sequence)) = load_animation(jar, &name) {
+                let length = sequence.iter().map(|s| s.1).sum();
+                animations.push(Animation { x: cx as u32, y: cy as u32, frames, sequence, length });
+            }
             for row in 0..TILE {
                 let dst = ((cy + row) * width + cx) * 4;
                 rgba[dst..dst + TILE * 4].copy_from_slice(&px[row * TILE * 4..(row + 1) * TILE * 4]);
@@ -109,7 +183,7 @@ impl Atlas {
             alpha.insert(name, (has_alpha, translucent));
         }
         let mips = mipmaps(&rgba, width, height);
-        Ok(Self { width: width as u32, height: height as u32, rgba, mips, rects, alpha })
+        Ok(Self { width: width as u32, height: height as u32, rgba, mips, rects, alpha, animations })
     }
 
     pub fn rect(&self, name: &str) -> [f32; 4] {

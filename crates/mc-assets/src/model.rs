@@ -84,6 +84,44 @@ fn texture_name(name: &str) -> String {
 struct Resolved {
     textures: HashMap<String, String>,
     elements: Vec<Value>,
+    /// Display transforms by context (`gui`, `firstperson_righthand`, `ground`, ...), nearest definition wins.
+    display: HashMap<String, Value>,
+
+
+}
+
+/// An item model's placement for one display context, like vanilla's `ItemTransform`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Transform {
+    /// Degrees around X, Y, Z (applied in that order).
+    pub rotation: [f32; 3],
+    /// In blocks.
+    pub translation: [f32; 3],
+    pub scale: [f32; 3],
+}
+
+impl Default for Transform {
+    fn default() -> Self {
+        Self { rotation: [0.0; 3], translation: [0.0; 3], scale: [1.0; 3] }
+    }
+}
+
+impl Transform {
+    fn parse(v: &Value) -> Self {
+        let get = |k: &str, d: [f32; 3]| vec3(&v[k]).unwrap_or(d);
+        let t = get("translation", [0.0; 3]).map(|c| c.clamp(-80.0, 80.0) / 16.0);
+        let s = get("scale", [1.0; 3]).map(|c| c.clamp(-4.0, 4.0));
+        Self { rotation: get("rotation", [0.0; 3]), translation: t, scale: s }
+    }
+}
+
+/// How an item is drawn, before atlas UVs are known.
+pub struct ItemModelDef {
+    /// The model to bake for 3D items (block-shaped models with elements).
+    pub elements_model: Option<String>,
+    /// Flat icon texture (`layer0`, or a representative face of block models).
+    pub icon: Option<String>,
+    pub display: HashMap<String, Transform>,
 }
 
 /// A quad before atlas UVs are known.
@@ -226,7 +264,8 @@ impl Baker {
             for m in chain.iter().rev() {
                 if let Some(t) = m["textures"].as_object() {
                     for (k, v) in t {
-                        if let Some(s) = v.as_str() {
+                        // 26.3 also allows {"sprite": ..., "force_translucent": true} (glass and panes).
+                        if let Some(s) = v.as_str().or_else(|| v["sprite"].as_str()) {
                             textures.insert(k.clone(), s.to_string());
                         }
                     }
@@ -236,7 +275,16 @@ impl Baker {
                 .iter()
                 .find_map(|m| m["elements"].as_array().cloned())
                 .unwrap_or_default();
-            Some(Arc::new(Resolved { textures, elements }))
+            let mut display = HashMap::new();
+            for m in chain.iter().rev() {
+                if let Some(d) = m["display"].as_object() {
+                    for (k, v) in d {
+                        display.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+
+            Some(Arc::new(Resolved { textures, elements, display }))
         };
         self.models.insert(name.to_string(), result.clone());
         result
@@ -341,6 +389,33 @@ impl Baker {
     /// Picks a flat icon texture for an item: `layer0` for drawn items, a representative face for block items.
     /// Registers the texture so it lands in the atlas.
     /// Returns the texture and whether the item is drawn as a block.
+    /// Everything needed to draw an item: its 3D model (if block-shaped), flat icon and display transforms.
+    pub fn item_model(&mut self, jar: &mut Jar, item: &str) -> Option<ItemModelDef> {
+        fn first_model(v: &Value) -> Option<String> {
+            match v {
+                Value::Object(o) => {
+                    if let (Some(Value::String(m)), true) = (o.get("model"), o.get("type").and_then(Value::as_str) == Some("minecraft:model")) {
+                        return Some(m.clone());
+                    }
+                    o.values().find_map(first_model)
+                }
+                Value::Array(a) => a.iter().find_map(first_model),
+                _ => None,
+            }
+        }
+        let def = jar.json(&format!("assets/minecraft/items/{item}.json"))?;
+        let model_name = first_model(&def)?;
+        let model = self.resolve(jar, &model_name)?;
+        let icon = self.item_icon(jar, item).map(|(t, _)| t);
+        let display = model.display.iter().map(|(k, v)| (k.clone(), Transform::parse(v))).collect();
+        let elements_model = (!model.elements.is_empty()).then(|| model_name.clone());
+        if let Some(m) = &elements_model {
+            // Bake now so its textures are registered before the atlas is stitched.
+            self.bake(jar, &VariantRef { model: m.clone(), x: 0, y: 0 });
+        }
+        Some(ItemModelDef { elements_model, icon, display })
+    }
+
     pub fn item_icon(&mut self, jar: &mut Jar, item: &str) -> Option<(String, bool)> {
         fn first_model(v: &Value) -> Option<String> {
             match v {
@@ -365,7 +440,7 @@ impl Baker {
 
     /// Loads every referenced texture (plus fluids) and packs the atlas.
     pub fn stitch(&mut self, jar: &mut Jar) -> anyhow::Result<Atlas> {
-        let fluids = ["minecraft:block/water_still".to_string(), "minecraft:block/lava_still".to_string()];
+        let fluids = ["water_still", "lava_still", "water_flow", "lava_flow"].map(|t| format!("minecraft:block/{t}"));
         let cracks = (0..10).map(|i| format!("minecraft:block/destroy_stage_{i}"));
         for extra in fluids.into_iter().chain(cracks) {
             if !self.texture_ids.contains_key(&extra) {

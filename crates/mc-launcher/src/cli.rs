@@ -11,7 +11,7 @@ use std::time::Duration;
 pub fn run(args: &[String]) -> bool {
     let Some(pos) = args.iter().position(|a| a == "--install") else { return false };
     let Some(id) = args.get(pos + 1) else {
-        eprintln!("usage: mc-launcher --install <version> [--launch]");
+        eprintln!("usage: mc-launcher --install <version> [--launch | --singleplayer [--world <folder>] [--accept-eula]]");
         return true;
     };
     let paths = Paths::new();
@@ -54,21 +54,22 @@ pub fn run(args: &[String]) -> bool {
         // Only for scripted testing: the UI asks for EULA acceptance; here `--accept-eula` must be passed explicitly.
         let settings = Settings::load(&paths.root);
         let eula = args.iter().any(|a| a == "--accept-eula") || settings.eula_accepted;
-        match crate::singleplayer::start(&paths, &prepared, &settings.username, &settings.world, eula, &progress) {
-            Ok(mut running) => {
-                println!("world running; Rust client pid {}", running.client.id());
-                let _ = running.client.wait();
-                println!("client closed; saving world");
-                crate::singleplayer::stop(running);
+        let world = args.iter().position(|a| a == "--world").and_then(|i| args.get(i + 1)).cloned();
+        match crate::singleplayer::launch_client(&paths, &prepared, &settings.username, eula, world.as_deref(), &progress) {
+            Ok(mut client) => {
+                println!("Rust client running (pid {})", client.id());
+                let _ = client.wait();
             }
-            Err(e) => eprintln!("singleplayer failed: {e:#}"),
+            Err(e) => eprintln!("couldn't start the Rust client: {e:#}"),
         }
         return true;
     }
     if args.iter().any(|a| a == "--launch") {
         let settings = Settings::load(&paths.root);
         let account = Account::offline(&settings.username);
-        match launch::launch(&paths, &prepared, &account, settings.memory_mb, None) {
+        // `--join host:port` drops straight into a server (vanilla's quick play).
+        let join: Vec<String> = args.iter().position(|a| a == "--join").and_then(|i| args.get(i + 1)).map(|a| vec!["--quickPlayMultiplayer".into(), a.clone()]).unwrap_or_default();
+        match launch::launch(&paths, &prepared, &account, settings.memory_mb, None, &join) {
             Ok(child) => println!("launched (pid {}); log: game/logs/mcrs-launch.log", child.id()),
             Err(e) => eprintln!("launch failed: {e:#}"),
         }

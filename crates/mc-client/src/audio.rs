@@ -8,7 +8,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const MUSIC_VOLUME: f32 = 0.35;
+/// Sound categories in vanilla's `SoundSource` order (the server sends this index with each sound).
+pub mod category {
+    pub const MASTER: usize = 0;
+    pub const MUSIC: usize = 1;
+    pub const BLOCKS: usize = 4;
+    pub const UI: usize = 10;
+    pub const COUNT: usize = 11;
+    pub const NAMES: [&str; COUNT] = ["master", "music", "record", "weather", "block", "hostile", "neutral", "player", "ambient", "voice", "ui"];
+}
 
 #[derive(Clone)]
 struct Variant {
@@ -25,13 +33,18 @@ pub struct Audio {
     /// Asset path (`minecraft/sounds/dig/stone1.ogg`) to its file in `assets/objects`.
     files: HashMap<String, PathBuf>,
     events: HashMap<String, Vec<Variant>>,
-    cache: HashMap<PathBuf, std::sync::Arc<[u8]>>,
+    cache: HashMap<PathBuf, std::sync::Arc<Decoded>>,
     rng: u64,
     listener: [f64; 3],
     /// Unit vector to the listener's right.
     right: [f64; 3],
     music: Option<rodio::Player>,
+    /// Which music event is playing (`music.menu`, `music.game`).
+    music_kind: &'static str,
+    music_gain: f32,
     next_music: Instant,
+    /// Volume per category, 0..1 (from the options).
+    pub volumes: [f32; category::COUNT],
 }
 
 fn object_path(objects: &Path, hash: &str) -> PathBuf {
@@ -82,8 +95,10 @@ impl Audio {
             listener: [0.0; 3],
             right: [1.0, 0.0, 0.0],
             music: None,
-            // Vanilla waits a while before the first track.
-            next_music: Instant::now() + Duration::from_secs(20),
+            music_kind: "",
+            music_gain: 1.0,
+            next_music: Instant::now(),
+            volumes: [1.0; category::COUNT],
         })
     }
 
@@ -130,21 +145,30 @@ impl Audio {
         Some((v.name.clone(), v.volume, v.pitch))
     }
 
-    fn bytes(&mut self, file: &str) -> Option<std::sync::Arc<[u8]>> {
+    /// A sound file decoded once and kept (footsteps and digging repeat a lot).
+    fn decoded(&mut self, file: &str) -> Option<std::sync::Arc<Decoded>> {
         let path = file.strip_prefix("minecraft:").unwrap_or(file);
         let disk = self.files.get(&format!("minecraft/sounds/{path}.ogg"))?.clone();
-        if let Some(b) = self.cache.get(&disk) {
-            return Some(b.clone());
+        if let Some(d) = self.cache.get(&disk) {
+            return Some(d.clone());
         }
-        let b: std::sync::Arc<[u8]> = std::fs::read(&disk).ok()?.into();
-        self.cache.insert(disk, b.clone());
-        Some(b)
+        let d = std::sync::Arc::new(decode(std::fs::File::open(&disk).ok()?)?);
+        self.cache.insert(disk, d.clone());
+        Some(d)
     }
 
     /// Plays a sound event at a world position (or at the listener when `None`), like `SoundManager.play`.
-    pub fn play(&mut self, event: &str, at: Option<[f64; 3]>, volume: f32, pitch: f32) {
+    /// `category` is a [`category`] index; its volume and the master volume scale the sound.
+    pub fn play(&mut self, event: &str, at: Option<[f64; 3]>, volume: f32, pitch: f32, category: usize) {
+        let mix = self.volumes[category::MASTER] * self.volumes.get(category).copied().unwrap_or(1.0);
+        if mix <= 0.0 {
+            if std::env::var_os("MCRS_DEBUG_SOUND").is_some() {
+                eprintln!("sound {event} muted (category {category})");
+            }
+            return;
+        }
         let Some((file, v_vol, v_pitch)) = self.pick(event, 0) else { return };
-        let volume = (volume * v_vol).clamp(0.0, 1.0);
+        let volume = (volume * v_vol).clamp(0.0, 1.0) * mix;
         let pitch = (pitch * v_pitch).clamp(0.5, 2.0);
         // Linear falloff to 16 blocks, scaled by volumes over 1 (vanilla's attenuation distance).
         let (gain, pan) = match at {
@@ -160,16 +184,30 @@ impl Audio {
                 (volume.min(1.0) * (1.0 - dist / range) as f32, pan as f32)
             }
         };
-        let Some(bytes) = self.bytes(&file) else { return };
-        let Ok(decoder) = rodio::Decoder::try_from(std::io::Cursor::new(bytes)) else { return };
-        // Pan with constant total loudness: ears offset left/right of a unit-distance emitter.
-        let emitter = [pan, 0.0, 1.0];
-        let source = rodio::source::Spatial::new(decoder.speed(pitch).amplify(gain), emitter, [-0.5, 0.0, 0.0], [0.5, 0.0, 0.0]);
-        self.sink.mixer().add(source);
+        if std::env::var_os("MCRS_DEBUG_SOUND").is_some() {
+            eprintln!("sound {event} file {file} gain {gain:.2} pan {pan:.2}");
+        }
+        let Some(decoded) = self.decoded(&file) else { return };
+        self.sink.mixer().add(effect(&decoded, pitch, gain, pan));
     }
 
-    /// Starts a new background track when the last one finished and the pause is over.
-    pub fn tick_music(&mut self) {
+    /// Keeps the music volume in line with the options.
+    pub fn update_music_volume(&mut self) {
+        let v = self.volumes[category::MASTER] * self.volumes[category::MUSIC] * self.music_gain;
+        if let Some(m) = &self.music {
+            m.set_volume(v);
+        }
+    }
+
+    /// Starts a new background track of `kind` (`music.menu` or `music.game`) when the last one finished and the
+    /// pause is over. Switching kind (entering or leaving a world) stops the current track.
+    pub fn tick_music(&mut self, kind: &'static str) {
+        if kind != self.music_kind {
+            self.music = None;
+            self.music_kind = kind;
+            // The menu starts its music right away; in game vanilla waits a while before the first track.
+            self.next_music = Instant::now() + if kind == "music.menu" { Duration::from_secs(1) } else { Duration::from_secs(30) };
+        }
         if self.music.as_ref().is_some_and(|m| !m.empty()) || Instant::now() < self.next_music {
             return;
         }
@@ -178,14 +216,58 @@ impl Audio {
             self.next_music = Instant::now() + Duration::from_secs(120 + (self.random() % 240) as u64);
             return;
         }
-        let Some((file, vol, _)) = self.pick("music.game", 0) else { return };
+        let Some((file, vol, _)) = self.pick(kind, 0) else { return };
         let path = file.strip_prefix("minecraft:").unwrap_or(&file);
         let Some(disk) = self.files.get(&format!("minecraft/sounds/{path}.ogg")).cloned() else { return };
         let Ok(f) = std::fs::File::open(disk) else { return };
         let Ok(decoder) = rodio::Decoder::try_from(f) else { return };
         let player = rodio::Player::connect_new(self.sink.mixer());
-        player.set_volume(MUSIC_VOLUME * vol);
+        self.music_gain = vol;
         player.append(decoder);
         self.music = Some(player);
+        self.update_music_volume();
     }
 }
+
+/// Decoded samples of one sound file.
+pub struct Decoded {
+    channels: rodio::ChannelCount,
+    rate: rodio::SampleRate,
+    samples: Vec<f32>,
+}
+
+/// Decodes a whole file. Effects play from these buffers: rodio 0.23's Vorbis decoder goes silent when the mixer
+/// resamples it (mono 44.1 kHz into the device format), but a sample buffer converts fine.
+fn decode(r: impl std::io::Read + std::io::Seek + Send + Sync + 'static) -> Option<Decoded> {
+    let d = rodio::Decoder::new(std::io::BufReader::new(r)).ok()?;
+    let (channels, rate) = (d.channels(), d.sample_rate());
+    Some(Decoded { channels, rate, samples: d.collect() })
+}
+
+/// A sound effect ready for the mixer: pitched, scaled and panned.
+fn effect(d: &Decoded, pitch: f32, gain: f32, pan: f32) -> impl Source + Send + 'static {
+    let buf = rodio::buffer::SamplesBuffer::new(d.channels, d.rate, d.samples.clone());
+    // Pan with constant total loudness: ears offset left/right of a unit-distance emitter.
+    rodio::source::Spatial::new(buf.speed(pitch).amplify(gain), [pan, 0.0, 1.0], [-0.5, 0.0, 0.0], [0.5, 0.0, 0.0])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real block sound from the installed assets must come out of the mixer audible (it used to be silent).
+    #[test]
+    fn effects_are_audible() {
+        let data = PathBuf::from(std::env::var("USERPROFILE").unwrap_or_default()).join("mcrs").join("data");
+        let Ok(index) = std::fs::read_to_string(data.join("assets/indexes/34.json")) else { return };
+        let index: Value = serde_json::from_str(&index).unwrap();
+        let hash = index["objects"]["minecraft/sounds/dig/stone1.ogg"]["hash"].as_str().unwrap().to_string();
+        let d = decode(std::fs::File::open(object_path(&data.join("assets/objects"), &hash)).unwrap()).unwrap();
+        // Through a device-style mixer (48 kHz stereo), as play() sends it.
+        let (mixer, out) = rodio::mixer::mixer(std::num::NonZero::new(2).unwrap(), std::num::NonZero::new(48_000).unwrap());
+        mixer.add(effect(&d, 0.8, 0.5, 0.3));
+        let peak = out.take(40_000).fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(peak > 0.01, "peak {peak}");
+    }
+}
+

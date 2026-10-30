@@ -33,6 +33,9 @@ pub trait World {
     fn boxes(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>);
     fn friction(&self, x: i32, y: i32, z: i32) -> f32;
     fn water(&self, x: i32, y: i32, z: i32) -> bool;
+    fn lava(&self, _x: i32, _y: i32, _z: i32) -> bool {
+        false
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -44,6 +47,8 @@ pub struct Input {
     pub jump: bool,
     pub sprint: bool,
     pub sneak: bool,
+    /// Look pitch in degrees (down positive), for steering while swimming.
+    pub pitch: f32,
 }
 
 pub struct Body {
@@ -53,6 +58,8 @@ pub struct Body {
     pub on_ground: bool,
     pub horizontal_collision: bool,
     jump_delay: u8,
+    /// Sprint-swimming: the 0.6-tall swim pose, steered by where you look.
+    pub swimming: bool,
 }
 
 /// Vanilla scales diagonal stick/key input so the square of possible inputs maps onto the unit circle.
@@ -114,18 +121,28 @@ fn gather(world: &impl World, region: &Aabb, out: &mut Vec<Aabb>) {
 
 impl Body {
     pub fn new(pos: [f64; 3]) -> Self {
-        Self { pos, vel: [0.0; 3], on_ground: false, horizontal_collision: false, jump_delay: 0 }
+        Self { pos, vel: [0.0; 3], on_ground: false, horizontal_collision: false, jump_delay: 0, swimming: false }
     }
 
     pub fn aabb(&self) -> Aabb {
         let h = WIDTH / 2.0;
-        Aabb { min: [self.pos[0] - h, self.pos[1], self.pos[2] - h], max: [self.pos[0] + h, self.pos[1] + HEIGHT, self.pos[2] + h] }
+        Aabb { min: [self.pos[0] - h, self.pos[1], self.pos[2] - h], max: [self.pos[0] + h, self.pos[1] + if self.swimming { 0.6 } else { HEIGHT }, self.pos[2] + h] }
+    }
+
+    pub fn in_fluid(&self, world: &impl World) -> bool {
+        self.in_water(world) || self.in_lava(world)
     }
 
     fn in_water(&self, world: &impl World) -> bool {
         let [x, y, z] = self.pos;
         let (bx, bz) = (x.floor() as i32, z.floor() as i32);
         world.water(bx, y.floor() as i32, bz) || world.water(bx, (y + 0.9).floor() as i32, bz)
+    }
+
+    fn in_lava(&self, world: &impl World) -> bool {
+        let [x, y, z] = self.pos;
+        let (bx, bz) = (x.floor() as i32, z.floor() as i32);
+        world.lava(bx, y.floor() as i32, bz) || world.lava(bx, (y + 0.4).floor() as i32, bz)
     }
 
     /// `Entity.collide`: collision with step-up onto blocks up to 0.6 high.
@@ -156,6 +173,41 @@ impl Body {
             }
         }
         step
+    }
+
+    /// `Entity.isFree`: nothing solid in the box moved by `d`.
+    fn is_free(&self, d: [f64; 3], world: &impl World, shapes: &mut Vec<Aabb>) -> bool {
+        let b = self.aabb().offset(d);
+        gather(world, &b, shapes);
+        !shapes.iter().any(|s| (0..3).all(|i| s.min[i] < b.max[i] - EPSILON && s.max[i] > b.min[i] + EPSILON))
+    }
+
+    /// `Entity.canFallAtLeast`: nothing solid within `dist` below the box moved by (dx, dz).
+    fn can_fall(&self, dx: f64, dz: f64, dist: f64, world: &impl World, shapes: &mut Vec<Aabb>) -> bool {
+        let b = self.aabb();
+        let probe = Aabb { min: [b.min[0] + EPSILON + dx, b.min[1] - dist - EPSILON, b.min[2] + EPSILON + dz], max: [b.max[0] - EPSILON + dx, b.min[1], b.max[2] - EPSILON + dz] };
+        gather(world, &probe, shapes);
+        !shapes.iter().any(|s| (0..3).all(|i| s.min[i] < probe.max[i] && s.max[i] > probe.min[i]))
+    }
+
+    /// `Player.maybeBackOffFromEdge`: while sneaking on the ground, shorten the move in 0.05 steps until it
+    /// wouldn't drop more than a step height.
+    fn back_off_edge(&self, mut d: [f64; 3], world: &impl World, shapes: &mut Vec<Aabb>) -> [f64; 3] {
+        if d[1] > 0.0 || !self.on_ground || self.can_fall(0.0, 0.0, STEP_HEIGHT, world, shapes) {
+            return d;
+        }
+        let shrink = |v: f64| if v.abs() <= 0.05 { 0.0 } else { v - 0.05 * v.signum() };
+        while d[0] != 0.0 && self.can_fall(d[0], 0.0, STEP_HEIGHT, world, shapes) {
+            d[0] = shrink(d[0]);
+        }
+        while d[2] != 0.0 && self.can_fall(0.0, d[2], STEP_HEIGHT, world, shapes) {
+            d[2] = shrink(d[2]);
+        }
+        while d[0] != 0.0 && d[2] != 0.0 && self.can_fall(d[0], d[2], STEP_HEIGHT, world, shapes) {
+            d[0] = shrink(d[0]);
+            d[2] = shrink(d[2]);
+        }
+        d
     }
 
     /// `Entity.move`: applies collision, updates ground/collision flags and stops velocity on blocked axes.
@@ -202,9 +254,10 @@ impl Body {
             }
         }
         let in_water = self.in_water(world);
+        let in_lava = !in_water && self.in_lava(world);
         self.jump_delay = self.jump_delay.saturating_sub(1);
         if input.jump {
-            if in_water {
+            if in_water || in_lava {
                 self.vel[1] += 0.04;
             } else if self.on_ground && self.jump_delay == 0 {
                 self.vel[1] = self.vel[1].max(0.42);
@@ -229,19 +282,50 @@ impl Body {
         }
         let dir = [v[0] as f64, 0.0, v[1] as f64];
 
+        // Entity.updateSwimming: start when sprinting with eyes underwater, stop when no longer sprinting in water.
+        let [px, py, pz] = self.pos;
+        let water_at = |dy: f64| world.water(px.floor() as i32, (py + dy).floor() as i32, pz.floor() as i32);
+        let eye_in_water = water_at(if self.swimming { 0.4 } else { 1.62 });
+        self.swimming = input.sprint && in_water && (self.swimming || eye_in_water);
+        if in_water && input.sneak {
+            // goDownInWater.
+            self.vel[1] -= 0.04;
+        }
+        if self.swimming {
+            // Player.travel: ease the vertical speed toward where you look.
+            let look_y = -(input.pitch.to_radians() as f64).sin();
+            let k = if look_y < -0.2 { 0.085 } else { 0.06 };
+            if look_y <= 0.0 || input.jump || water_at(0.9) {
+                self.vel[1] += (look_y - self.vel[1]) * k;
+            }
+        }
+
         if in_water {
             let drag = if input.sprint { 0.9 } else { 0.8 };
+            let falling = self.vel[1] <= 0.0;
+            let old_y = self.pos[1];
             self.move_relative(0.02, dir, yaw);
             self.do_move(self.vel, world, &mut shapes);
-            let falling = self.vel[1] <= 0.0;
             self.vel = [self.vel[0] * drag, self.vel[1] * 0.8, self.vel[2] * drag];
             if !input.sprint {
                 // getFluidFallingAdjustedMovement: sink slowly.
                 let y = self.vel[1];
                 self.vel[1] = if falling && (y - 0.005).abs() >= 0.003 && (y - GRAVITY / 16.0).abs() < 0.003 { -0.003 } else { y - GRAVITY / 16.0 };
             }
+            // jumpOutOfFluid: a boost onto the bank, only if there's room above.
+            let lift = [self.vel[0], self.vel[1] + 0.6 - self.pos[1] + old_y, self.vel[2]];
+            if self.horizontal_collision && self.is_free(lift, world, &mut shapes) {
+                self.vel[1] = 0.3;
+            }
+            return;
+        }
+
+        if in_lava {
+            // travelInLava: slow, heavy drag, a quarter of gravity.
+            self.move_relative(0.02, dir, yaw);
+            self.do_move(self.vel, world, &mut shapes);
+            self.vel = [self.vel[0] * 0.5, self.vel[1] * 0.5 - GRAVITY / 4.0, self.vel[2] * 0.5];
             if self.horizontal_collision {
-                // Lets you climb out onto a bank.
                 self.vel[1] = 0.3;
             }
             return;
@@ -258,7 +342,8 @@ impl Body {
             0.02
         };
         self.move_relative(speed, dir, yaw);
-        self.do_move(self.vel, world, &mut shapes);
+        let delta = if input.sneak { self.back_off_edge(self.vel, world, &mut shapes) } else { self.vel };
+        self.do_move(delta, world, &mut shapes);
         self.vel[1] = (self.vel[1] - GRAVITY) * 0.98;
         let f = friction * 0.91;
         self.vel[0] *= f;
@@ -348,5 +433,91 @@ mod tests {
         assert!((b.pos[0] - 5.7).abs() < 1e-6, "x = {}", b.pos[0]);
         assert!(b.horizontal_collision);
         assert!((b.pos[1] - 64.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod fluid_and_edge_tests {
+    use super::*;
+
+    /// A 1-wide stone platform along x at y=63 (top at 64), water below y=60, and a lava pool around x=20.
+    struct Ledge;
+    impl World for Ledge {
+        fn boxes(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) {
+            let (fx, fy, fz) = (x as f64, y as f64, z as f64);
+            if (y == 63 && z == 0 && x < 10) || y < 40 {
+                out.push(Aabb { min: [fx, fy, fz], max: [fx + 1.0, fy + 1.0, fz + 1.0] });
+            }
+        }
+        fn friction(&self, _: i32, _: i32, _: i32) -> f32 {
+            0.6
+        }
+        fn water(&self, x: i32, y: i32, _: i32) -> bool {
+            y < 60 && x < 15
+        }
+        fn lava(&self, x: i32, y: i32, _: i32) -> bool {
+            y < 60 && x >= 15
+        }
+    }
+
+    #[test]
+    fn sneaking_stops_at_the_edge() {
+        let mut b = Body::new([0.5, 64.0, 0.5]);
+        // Walk forward (+z, off the platform) while sneaking for two seconds.
+        for _ in 0..40 {
+            b.tick(&Input { forward: 1.0, sneak: true, ..Default::default() }, 0.0, &Ledge);
+        }
+        assert!(b.pos[1] > 63.99 && b.on_ground, "fell off: {:?}", b.pos);
+        let mut b = Body::new([0.5, 64.0, 0.5]);
+        for _ in 0..40 {
+            b.tick(&Input { forward: 1.0, ..Default::default() }, 0.0, &Ledge);
+        }
+        assert!(b.pos[1] < 63.0, "walking should fall: {:?}", b.pos);
+    }
+
+    #[test]
+    fn swims_up_in_water_and_lava() {
+        for x in [5.5, 20.5] {
+            let mut b = Body::new([x, 50.0, 5.5]);
+            for _ in 0..40 {
+                b.tick(&Input { jump: true, ..Default::default() }, 0.0, &Ledge);
+            }
+            assert!(b.pos[1] > 51.0, "didn't rise at x={x}: {:?}", b.pos);
+        }
+    }
+}
+
+#[cfg(test)]
+mod swim_tests {
+    use super::*;
+
+    /// Deep water everywhere above a stone floor at y=40.
+    struct Sea;
+    impl World for Sea {
+        fn boxes(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) {
+            if y < 40 {
+                out.push(Aabb { min: [x as f64, y as f64, z as f64], max: [x as f64 + 1.0, y as f64 + 1.0, z as f64 + 1.0] });
+            }
+        }
+        fn friction(&self, _: i32, _: i32, _: i32) -> f32 {
+            0.6
+        }
+        fn water(&self, _: i32, y: i32, _: i32) -> bool {
+            y < 60
+        }
+    }
+
+    #[test]
+    fn sprint_swimming_dives_where_you_look_and_sneak_sinks() {
+        let mut b = Body::new([0.5, 50.0, 0.5]);
+        for _ in 0..40 {
+            b.tick(&Input { forward: 1.0, sprint: true, pitch: 45.0, ..Default::default() }, 0.0, &Sea);
+        }
+        assert!(b.swimming && b.pos[1] < 47.0 && b.pos[2] > 4.0, "dive: {:?}", b.pos);
+        let mut b = Body::new([0.5, 50.0, 0.5]);
+        for _ in 0..20 {
+            b.tick(&Input { sneak: true, ..Default::default() }, 0.0, &Sea);
+        }
+        assert!(b.pos[1] < 48.0, "sneak should sink: {:?}", b.pos);
     }
 }

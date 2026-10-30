@@ -1,19 +1,32 @@
-﻿//! Game client: window and input loop (winit, gilrs), prediction and player physics, ties the other crates together.
+﻿//! Game client: window and input loop (winit, gilrs), menus, player physics, ties the other crates together.
 //!
-//! `mc-client [--connect 127.0.0.1:25565] [--name Player] [--view-distance 8] [--no-vsync] [--no-noclip]` opens a window and renders the world.
-//! Starts walking (survival); double-tap jump or F to fly (spectator noclip, needs operator rights on the server).
-//! `--run "/give @s stone 64"` (repeatable) sends a chat line or command after joining.
-//! `--headless [--say "hi"] [--for 30] [--greet]` runs without a window; stdin lines are sent as chat.
+//! `mc-client [--data <dir>] [--name Player]` opens the title screen. Singleplayer worlds run on a hidden vanilla
+//! server (`--java`, `--server-jar`, `--eula` from the launcher); multiplayer connects to any offline-mode server.
+//! `--world <folder>` or `--connect host:port` skip the title screen. `--run "/give @s stone 64"` (repeatable)
+//! sends a chat line or command after joining. `--no-noclip` disables the spectator fly toggle.
+//! `--headless --connect host:port [--say "hi"] [--for 30] [--greet]` runs without a window; stdin lines are chat.
 
 mod app;
-mod entities;
-mod hand;
 mod audio;
+mod containers;
+mod creative;
+mod debug;
+mod entities;
+mod game;
+mod hand;
 mod hud;
 mod inventory;
+mod models;
+mod options;
+mod particles;
 mod physics;
+mod screens;
+mod servers;
 mod session;
+mod sky;
 mod target;
+mod ui;
+mod worlds;
 
 use anyhow::{Context, Result};
 use session::{Event, Options};
@@ -33,60 +46,52 @@ fn main() {
     }
 }
 
+/// The launcher's settings file: player name and whether the EULA was accepted there.
+fn launcher_settings(data: &std::path::Path) -> (Option<String>, bool) {
+    let v: serde_json::Value = std::fs::read_to_string(data.join("settings.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    (v["username"].as_str().map(str::to_string), v["eula_accepted"].as_bool().unwrap_or(false))
+}
+
 fn run() -> Result<()> {
     let started = Instant::now();
     let args: Vec<String> = std::env::args().collect();
-    let addr = arg(&args, "--connect").unwrap_or_else(|| "127.0.0.1:25565".into());
-    let name = arg(&args, "--name").unwrap_or_else(|| "Player".into());
-    let greet = args.iter().any(|a| a == "--greet");
+    let data = arg(&args, "--data").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var("USERPROFILE").unwrap_or_default()).join("mcrs").join("data"));
+    let (saved_name, eula) = launcher_settings(&data);
+    let name = arg(&args, "--name").or(saved_name).unwrap_or_else(|| "Player".into());
     if args.iter().any(|a| a == "--headless") {
-        return headless(&args, &addr, &name, greet);
+        let addr = arg(&args, "--connect").unwrap_or_else(|| "127.0.0.1:25565".into());
+        return headless(&args, &addr, &name, args.iter().any(|a| a == "--greet"));
     }
 
-    let data = arg(&args, "--data").map(PathBuf::from).unwrap_or_else(|| {
-        PathBuf::from(std::env::var("USERPROFILE").unwrap_or_default()).join("mcrs").join("data")
-    });
     let jar = data.join("versions").join("26.3").join("26.3.jar");
     let reports = data.join("reports");
-
-    // Load assets and connect at the same time.
-    let assets = std::thread::spawn(move || mc_assets::BlockModels::load(&jar, &reports));
-    let (tx, rx) = mc_protocol::connect(&addr).with_context(|| format!("connecting to {addr}"))?;
-    let models = Arc::new(assets.join().expect("asset thread panicked").context("loading block models")?);
+    let models = Arc::new(mc_assets::BlockModels::load(&jar, &reports).context("loading game assets")?);
     println!("assets ready after {:?} ({} block states)", started.elapsed(), models.states.len());
 
-    let view_distance: u8 = arg(&args, "--view-distance").and_then(|s| s.parse().ok()).unwrap_or(8).clamp(2, 64);
-    let (net_tx, net_rx) = std::sync::mpsc::channel();
-    {
-        let (tx, block_states) = (tx.clone(), models.states.len());
-        let components = inventory::Components::new(&models.components);
-        std::thread::spawn(move || {
-            let opts = Options {
-                addr: &addr,
-                name: &name,
-                greet,
-                block_states: Some(block_states),
-                drives_movement: true,
-                view_distance,
-                components: Some(&components),
-            };
-            match session::run(&opts, tx, rx, |e| {
-                let _ = net_tx.send(e);
-            }) {
-                Ok(reason) => println!("disconnected: {reason}"),
-                Err(e) => eprintln!("connection error: {e:#}"),
-            }
-        });
-    }
+    let setup = worlds::ServerSetup {
+        java: arg(&args, "--java").map(PathBuf::from).unwrap_or_else(|| data.join("runtime").join("java-runtime-epsilon").join("bin").join("java.exe")),
+        server_jar: arg(&args, "--server-jar").map(PathBuf::from).unwrap_or_else(|| data.join("versions").join("26.3").join("server.jar")),
+        worlds: data.join("worlds"),
+        eula: eula || args.iter().any(|a| a == "--eula"),
+    };
+    let _ = std::fs::create_dir_all(&setup.worlds);
 
     let event_loop = winit::event_loop::EventLoop::new()?;
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
-    let vsync = !args.iter().any(|a| a == "--no-vsync");
     let noclip = !args.iter().any(|a| a == "--no-noclip");
-    let mut app = app::App::new(started, models, net_rx, tx, vsync, noclip, view_distance);
+    let mut app = app::App::new(started, models, setup, name, noclip);
+    if args.iter().any(|a| a == "--no-vsync") {
+        app.options.vsync = false;
+    }
+    if let Some(v) = arg(&args, "--view-distance").and_then(|s| s.parse::<u8>().ok()) {
+        app.options.render_distance = v.clamp(2, 32);
+    }
     app.join_commands = args.windows(2).filter(|w| w[0] == "--run").map(|w| w[1].clone()).collect();
+    app.start_world = arg(&args, "--world");
+    app.start_server = arg(&args, "--connect");
     app.audio = audio::Audio::new(&data, "26.3").map_err(|e| eprintln!("sound disabled: {e:#}")).ok();
     event_loop.run_app(&mut app)?;
+    app.shutdown();
     Ok(())
 }
 
@@ -134,15 +139,18 @@ fn headless(args: &[String], addr: &str, name: &str, greet: bool) -> Result<()> 
         Event::Chunk(_) => {
             chunks.fetch_add(1, Relaxed);
         }
-        Event::Teleport(p, _) => println!("position {:.2} {:.2} {:.2}", p[0], p[1], p[2]),
+        Event::Teleport(p, _, _) => println!("position {:.2} {:.2} {:.2}", p[0], p[1], p[2]),
         Event::Chat(m) => println!("[chat] {m}"),
         Event::Health { health, .. } => println!("health {health:.1}"),
-        Event::ChatTag(t) => println!("[chat] {}", mc_protocol::text::plain(&t)),
-        Event::Forget(..) | Event::Blocks(_) | Event::Light(..) => {}
-        Event::Inventory(_) | Event::InventorySlot(..) | Event::PlayerSlot(..) | Event::HeldSlot(_) => {}
-        Event::Sound { .. } | Event::LevelEvent { .. } => {}
-        Event::EntityAdd { .. } | Event::EntityMove { .. } | Event::EntityRot { .. } | Event::EntityPos { .. } => {}
-        Event::EntityHead { .. } | Event::EntityRemove(_) => {}
+        Event::ChatTag(t) => {
+            println!("[chat] {}", mc_protocol::text::plain(&t));
+            if std::env::var_os("MCRS_DEBUG_CHAT").is_some() {
+                println!("{t:?}");
+            }
+        }
+        Event::Experience { level, total, .. } => println!("xp level {level} ({total} points)"),
+        Event::Time { day } => println!("time {day:?}"),
+        _ => {}
     })?;
     println!("disconnected: {reason}");
     println!("{} chunks received", chunks.load(Relaxed));

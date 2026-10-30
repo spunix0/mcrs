@@ -31,7 +31,8 @@ enum State {
 enum Msg {
     Manifest(Result<Manifest, String>),
     Prepared(Result<Prepared, String>),
-    Singleplayer(Result<singleplayer::Running, String>),
+    /// The Rust client started.
+    Client(Result<Child, String>),
 }
 
 pub struct App {
@@ -46,8 +47,8 @@ pub struct App {
     state: State,
     page: Page,
     child: Option<Child>,
-    /// A running singleplayer world (server + Rust client).
-    world: Option<singleplayer::Running>,
+    /// The running game is the Rust client (not the Java game).
+    rust: bool,
     speed: f64,
     sample: (Instant, u64),
 }
@@ -70,7 +71,7 @@ impl App {
             state: State::Idle,
             page: Page::Play,
             child: None,
-            world: None,
+            rust: false,
             speed: 0.0,
             sample: (Instant::now(), 0),
         };
@@ -94,7 +95,7 @@ impl App {
         self.manifest.as_ref().map(|m| m.latest.release.clone()).unwrap_or_else(|| "26.3".into())
     }
 
-    /// Installs the selected version, then launches the Rust client in singleplayer (`rust`) or the Java game.
+    /// Installs the selected version, then launches the Rust client (`rust`) or the Java game.
     fn start_play(&mut self, ctx: &Context, rust: bool) {
         if !valid_name(&self.settings.username) {
             self.page = Page::Account;
@@ -109,12 +110,16 @@ impl App {
         self.state = State::Working;
         let (paths, manifest, progress, tx, ctx) =
             (self.paths.clone(), self.manifest.clone(), self.progress.clone(), self.tx.clone(), ctx.clone());
-        let (name, world, eula) = (self.settings.username.clone(), self.settings.world.clone(), self.settings.eula_accepted);
+        // The client reads the name and EULA choice from the settings file too.
+        self.settings.save(&self.paths.root);
+        self.saved = self.settings.clone();
+        self.rust = rust;
+        let (name, eula) = (self.settings.username.clone(), self.settings.eula_accepted);
         std::thread::spawn(move || {
             let r = install::prepare(&paths, &id, manifest.as_ref(), &progress).map_err(|e| format!("{e:#}"));
             let msg = match r {
                 Ok(p) if rust => {
-                    Msg::Singleplayer(singleplayer::start(&paths, &p, &name, &world, eula, &progress).map_err(|e| format!("{e:#}")))
+                    Msg::Client(singleplayer::launch_client(&paths, &p, &name, eula, None, &progress).map_err(|e| format!("{e:#}")))
                 }
                 r => Msg::Prepared(r),
             };
@@ -131,17 +136,17 @@ impl App {
                     self.manifest_err = None;
                 }
                 Msg::Manifest(Err(e)) => self.manifest_err = Some(e),
-                Msg::Prepared(Err(e)) | Msg::Singleplayer(Err(e)) => {
+                Msg::Prepared(Err(e)) | Msg::Client(Err(e)) => {
                     self.state = if e == "cancelled" { State::Idle } else { State::Failed(e) };
                 }
-                Msg::Singleplayer(Ok(running)) => {
-                    self.world = Some(running);
+                Msg::Client(Ok(child)) => {
+                    self.child = Some(child);
                     self.state = State::Running;
                 }
                 Msg::Prepared(Ok(p)) => {
                     let account = Account::offline(&self.settings.username);
                     let java = (!self.settings.java_override.trim().is_empty()).then_some(self.settings.java_override.as_str());
-                    match launch::launch(&self.paths, &p, &account, self.settings.memory_mb, java) {
+                    match launch::launch(&self.paths, &p, &account, self.settings.memory_mb, java, &[]) {
                         Ok(child) => {
                             self.child = Some(child);
                             self.state = State::Running;
@@ -154,23 +159,6 @@ impl App {
     }
 
     fn poll_child(&mut self) {
-        if let Some(w) = &mut self.world {
-            if let Ok(Some(status)) = w.client.try_wait() {
-                let running = self.world.take().unwrap();
-                // Save and stop the world in the background so the launcher stays responsive.
-                std::thread::spawn(move || singleplayer::stop(running));
-                self.state = if status.success() {
-                    State::Idle
-                } else {
-                    State::Failed(format!("The Rust client exited with {status}. See game/logs/mcrs-client.log in the data folder."))
-                };
-            } else if let Ok(Some(status)) = w.server.try_wait() {
-                let log = w.world_dir.join("logs").join("latest.log");
-                let _ = w.client.kill();
-                self.world = None;
-                self.state = State::Failed(format!("The world server stopped ({status}). See {}", log.display()));
-            }
-        }
         let Some(child) = &mut self.child else { return };
         if let Ok(Some(status)) = child.try_wait() {
             self.child = None;
@@ -178,7 +166,8 @@ impl App {
                 State::Idle
             } else {
                 let code = status.code().map_or("unknown".into(), |c| c.to_string());
-                State::Failed(format!("Minecraft exited with code {code}. See game/logs/mcrs-launch.log in the data folder."))
+                let log = if self.rust { "mcrs-client.log" } else { "mcrs-launch.log" };
+                State::Failed(format!("Minecraft exited with code {code}. See game/logs/{log} in the data folder."))
             };
         }
     }
@@ -336,8 +325,7 @@ impl App {
                 State::Idle | State::Failed(_) => {
                     if rust_ready {
                         let label = if installed { "PLAY" } else { "INSTALL & PLAY" };
-                        let accepted = self.settings.eula_accepted;
-                        if play_button(ui, label, None).clicked() && accepted {
+                        if play_button(ui, label, None).clicked() {
                             self.start_play(ctx, true);
                         }
                         ui.add_space(6.0);
@@ -345,9 +333,9 @@ impl App {
                             ui.checkbox(&mut self.settings.eula_accepted, "");
                             ui.label(text("I accept the", 13.0, MUTED));
                             ui.hyperlink_to(text("Minecraft EULA", 13.0, ACCENT), "https://aka.ms/MinecraftEULA");
-                            ui.label(text("(runs your world locally)", 13.0, MUTED));
+                            ui.label(text("(needed for singleplayer worlds)", 13.0, MUTED));
                         });
-                        ui.label(text(format!("Singleplayer world \"{}\" in the Rust client", self.settings.world), 13.0, MUTED));
+                        ui.label(text("Opens the Rust client: singleplayer, multiplayer and options are on its title screen", 13.0, MUTED));
                         if ui.add(Button::new(text("Play Java Edition instead", 13.0, MUTED)).frame(false)).on_hover_cursor(CursorIcon::PointingHand).clicked() {
                             self.start_play(ctx, false);
                         }
@@ -370,8 +358,8 @@ impl App {
                 }
                 State::Running => {
                     play_button(ui, "RUNNING", Some(1.0));
-                    let note = if self.world.is_some() {
-                        "Playing in the Rust client. Closing its window saves and stops the world."
+                    let note = if self.rust {
+                        "Playing in the Rust client. Quitting it saves your world."
                     } else {
                         "Minecraft is running. This window stays out of the way."
                     };
@@ -575,16 +563,6 @@ impl App {
             ui.label(bold("Java", 17.0, TEXT));
             ui.label(text("Leave empty to use the runtime Mojang ships for each version (downloaded automatically).", 13.5, MUTED));
             ui.add(TextEdit::singleline(&mut self.settings.java_override).hint_text("Path to java.exe (optional)").desired_width(420.0).margin(Margin::symmetric(12, 9)));
-        });
-        card(ui, |ui| {
-            ui.label(bold("Singleplayer world", 17.0, TEXT));
-            ui.label(text("Folder name under worlds/ in the data folder. A new name creates a new world.", 13.5, MUTED));
-            ui.add(TextEdit::singleline(&mut self.settings.world).hint_text("world").desired_width(280.0).margin(Margin::symmetric(12, 9)));
-            // Keep it a safe folder name.
-            self.settings.world.retain(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ' ');
-            if self.settings.world.trim().is_empty() {
-                self.settings.world = "world".into();
-            }
         });
         card(ui, |ui| {
             ui.label(bold("Folders", 17.0, TEXT));

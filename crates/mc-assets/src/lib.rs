@@ -15,9 +15,13 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-pub use atlas::Atlas;
-pub use gui::{GuiAtlas, Sprite};
+pub use atlas::{Animation, Atlas};
+pub use gui::{GuiAtlas, Panorama, Sprite};
+pub use model::Transform;
 pub use tools::{Mineable, Tool, ToolKind, tool_for_item};
+
+/// Creative inventory tabs from vanilla's `CreativeModeTabs` (`tools/creative_tabs.pl`): tab key, kind, name.
+pub const CREATIVE_TABS: &str = include_str!("../data/creative_tabs.tsv");
 use tools::{ToolRules, shears_speed};
 
 /// Face directions in vanilla order: down, up, north, south, west, east.
@@ -106,6 +110,8 @@ pub struct StateModel {
     /// Hides neighbor faces that point at it.
     pub opaque: bool,
     pub fluid: Option<Fluid>,
+    /// The `level` property of water and lava: 0 source, 1..7 flowing, 8+ falling.
+    pub fluid_level: u8,
     pub tint: [u8; 3],
     /// Collision boxes in block units (`[min x, y, z, max x, y, z]`). Approximated from model elements, since
     /// vanilla defines shapes in code; see [`collision_for`].
@@ -210,8 +216,9 @@ fn hardness_table() -> HashMap<&'static str, (f32, bool)> {
 
 impl StateModel {
     /// Ticks to mine holding `tool` (vanilla `getDestroyProgress` / `Player.getDestroySpeed`),
-    /// or `None` if it can't be mined. Efficiency and potion effects aren't counted yet.
-    pub fn break_ticks(&self, tool: Option<&Tool>, on_ground: bool) -> Option<u32> {
+    /// or `None` if it can't be mined. `efficiency` is the tool's Efficiency level (adds level squared + 1 to a
+    /// speed above 1, like the mining efficiency attribute); potion effects aren't counted yet.
+    pub fn break_ticks(&self, tool: Option<&Tool>, on_ground: bool, efficiency: u32) -> Option<u32> {
         if self.hardness < 0.0 {
             return None;
         }
@@ -226,6 +233,9 @@ impl StateModel {
             Some(t) if self.mineable.by == Some(t.kind) => (t.speed, t.tier.is_some_and(|i| self.mineable.correct_tiers & (1 << i) != 0)),
             _ => (1.0, false),
         };
+        if speed > 1.0 && efficiency > 0 {
+            speed += (efficiency * efficiency + 1) as f32;
+        }
         if !on_ground {
             speed /= 5.0;
         }
@@ -277,8 +287,62 @@ pub struct ItemInfo {
     /// Grass/foliage tint for icons whose texture is grayscale (leaves, grass, vines).
     pub tint: Option<[u8; 3]>,
     pub tool: Option<Tool>,
-    /// Drawn as a small cube in hand (block items) rather than a flat sprite.
+    /// Drawn as a 3D block model in hand and in inventories (block items) rather than a flat sprite.
     pub block: bool,
+    /// 3D geometry in model space (0..1): the block model, or the icon extruded into a 1/16 thick slab.
+    pub model: Option<Arc<Vec<Quad>>>,
+    /// Grass/foliage color for tinted model faces.
+    pub model_tint: [u8; 3],
+    /// Display transforms for first-person right hand, inventory slots and dropped items.
+    pub hand: Transform,
+    pub gui: Transform,
+    pub ground: Transform,
+}
+
+/// Turns a flat item sprite into vanilla's generated model: front and back faces plus a 1-pixel side wall
+/// wherever an opaque pixel borders a transparent one.
+fn extrude(atlas: &Atlas, rect: [f32; 4]) -> Vec<Quad> {
+    let (w, h) = (atlas.width as usize, atlas.height as usize);
+    let (x0, y0) = ((rect[0] * w as f32).round() as usize, (rect[1] * h as f32).round() as usize);
+    let n = (((rect[2] - rect[0]) * w as f32).round() as usize).max(1);
+    let opaque = |x: i32, y: i32| {
+        x >= 0 && y >= 0 && (x as usize) < n && (y as usize) < n && atlas.rgba[((y0 + y as usize) * w + x0 + x as usize) * 4 + 3] > 0
+    };
+    let [u0, v0, u1, v1] = rect;
+    let (z0, z1) = (7.5 / 16.0, 8.5 / 16.0);
+    let quad = |pos: [[f32; 3]; 4], uv: [[f32; 2]; 4], shade: f32| Quad { pos, uv, cull: None, shade, tinted: false, translucent: false };
+    let mut out = vec![
+        quad([[0.0, 1.0, z1], [0.0, 0.0, z1], [1.0, 0.0, z1], [1.0, 1.0, z1]], [[u0, v0], [u0, v1], [u1, v1], [u1, v0]], 0.8),
+        quad([[1.0, 1.0, z0], [1.0, 0.0, z0], [0.0, 0.0, z0], [0.0, 1.0, z0]], [[u1, v0], [u1, v1], [u0, v1], [u0, v0]], 0.8),
+    ];
+    let p = 1.0 / n as f32;
+    let (du, dv) = ((u1 - u0) / n as f32, (v1 - v0) / n as f32);
+    for y in 0..n as i32 {
+        for x in 0..n as i32 {
+            if !opaque(x, y) {
+                continue;
+            }
+            // Sample just this pixel (inset a little so neighbors don't bleed in).
+            let (pu, pv) = (u0 + du * (x as f32 + 0.1), v0 + dv * (y as f32 + 0.1));
+            let (qu, qv) = (u0 + du * (x as f32 + 0.9), v0 + dv * (y as f32 + 0.9));
+            let uv = [[pu, pv], [pu, qv], [qu, qv], [qu, pv]];
+            let (mx0, mx1) = (x as f32 * p, (x + 1) as f32 * p);
+            let (my0, my1) = (1.0 - (y + 1) as f32 * p, 1.0 - y as f32 * p);
+            if !opaque(x, y - 1) {
+                out.push(quad([[mx0, my1, z0], [mx0, my1, z1], [mx1, my1, z1], [mx1, my1, z0]], uv, 1.0));
+            }
+            if !opaque(x, y + 1) {
+                out.push(quad([[mx0, my0, z1], [mx0, my0, z0], [mx1, my0, z0], [mx1, my0, z1]], uv, 0.5));
+            }
+            if !opaque(x - 1, y) {
+                out.push(quad([[mx0, my1, z0], [mx0, my0, z0], [mx0, my0, z1], [mx0, my1, z1]], uv, 0.6));
+            }
+            if !opaque(x + 1, y) {
+                out.push(quad([[mx1, my1, z1], [mx1, my0, z1], [mx1, my0, z0], [mx1, my1, z0]], uv, 0.6));
+            }
+        }
+    }
+    out
 }
 
 pub struct BlockModels {
@@ -286,6 +350,9 @@ pub struct BlockModels {
     pub atlas: Atlas,
     pub water_uv: [f32; 4],
     pub lava_uv: [f32; 4],
+    /// Flowing fluid textures (sides and sloped surfaces).
+    pub water_flow_uv: [f32; 4],
+    pub lava_flow_uv: [f32; 4],
     /// Block-breaking crack textures, stage 0 to 9.
     pub crack_uv: [[f32; 4]; 10],
     /// Indexed by item protocol ID.
@@ -301,6 +368,8 @@ pub struct BlockModels {
     pub entities: Vec<EntityInfo>,
     /// English translations (`en_us.json`), e.g. `block.minecraft.stone` -> `Stone`.
     pub lang: HashMap<String, String>,
+    /// Menu (container screen) types by protocol ID, e.g. `generic_9x3`.
+    pub menus: Vec<String>,
 }
 
 /// `(registry name -> entries in protocol-ID order)` from the server's `reports/registries.json`.
@@ -404,6 +473,7 @@ impl BlockModels {
         let item_names = load_registry(&registries, "minecraft:item");
         let sound_events = load_registry(&registries, "minecraft:sound_event");
         let entities = entity_infos(load_registry(&registries, "minecraft:entity_type"));
+        let menus = load_registry(&registries, "minecraft:menu");
         let components = load_registry(&registries, "minecraft:data_component_type")
             .into_iter()
             .enumerate()
@@ -424,26 +494,44 @@ impl BlockModels {
             let baked: Vec<_> = parts.iter().map(|p| baker.bake(&mut jar, p)).collect();
             resolved.push(baked);
         }
-        let icon_textures: Vec<Option<(String, bool)>> = item_names.iter().map(|n| baker.item_icon(&mut jar, n)).collect();
+        let item_defs: Vec<Option<model::ItemModelDef>> = item_names.iter().map(|n| baker.item_model(&mut jar, n)).collect();
         let atlas = baker.stitch(&mut jar)?;
         let items = item_names
             .iter()
-            .zip(icon_textures)
-            .map(|(name, tex)| ItemInfo {
-                name: name.clone(),
-                icon: tex.as_ref().map(|t| atlas.rect(&t.0)),
-                block: tex.is_some_and(|t| t.1),
-                tint: item_tint(name),
-                tool: tool_for_item(name),
+            .zip(item_defs)
+            .map(|(name, def)| {
+                let icon = def.as_ref().and_then(|d| d.icon.as_ref()).map(|t| atlas.rect(t));
+                let model = def.as_ref().and_then(|d| match &d.elements_model {
+                    Some(m) => {
+                        let part = baker.bake(&mut jar, &model::VariantRef { model: m.clone(), x: 0, y: 0 });
+                        Some(Arc::new(part.quads.iter().map(|q| q.finish(&atlas)).collect::<Vec<_>>()))
+                    }
+                    None => icon.map(|r| Arc::new(extrude(&atlas, r))),
+                });
+                let display = |k: &str| def.as_ref().and_then(|d| d.display.get(k).copied()).unwrap_or_default();
+                ItemInfo {
+                    name: name.clone(),
+                    icon,
+                    block: def.as_ref().is_some_and(|d| d.elements_model.is_some()),
+                    model,
+                    model_tint: tint_for(name),
+                    hand: display("firstperson_righthand"),
+                    gui: display("gui"),
+                    ground: display("ground"),
+                    tint: item_tint(name),
+                    tool: tool_for_item(name),
+                }
             })
             .collect();
-        let gui = GuiAtlas::load(&mut jar)?;
+        let gui = GuiAtlas::load(&mut jar, &asset_reader(jar_path))?;
         let lang: HashMap<String, String> = jar
             .json("assets/minecraft/lang/en_us.json")
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
         let water_uv = atlas.rect("minecraft:block/water_still");
         let lava_uv = atlas.rect("minecraft:block/lava_still");
+        let water_flow_uv = atlas.rect("minecraft:block/water_flow");
+        let lava_flow_uv = atlas.rect("minecraft:block/lava_flow");
         let crack_uv = std::array::from_fn(|i| atlas.rect(&format!("minecraft:block/destroy_stage_{i}")));
 
         let hardness = hardness_table();
@@ -474,6 +562,7 @@ impl BlockModels {
                     quads: Arc::new(if is_air { Vec::new() } else { quads }),
                     opaque: opaque && !is_air,
                     fluid,
+                    fluid_level: s.props.iter().find(|(k, _)| k == "level").and_then(|(_, v)| v.parse().ok()).unwrap_or(0),
                     tint: tint_for(&s.block),
                     collision: Arc::new(if is_air { Vec::new() } else { collision_for(&s.block, boxes) }),
                     friction: friction_for(&s.block),
@@ -485,6 +574,24 @@ impl BlockModels {
                 }
             })
             .collect();
-        Ok(Self { states, atlas, water_uv, lava_uv, crack_uv, items, components, gui, sound_types: sound_types(), sound_events, entities, lang })
+        Ok(Self { states, atlas, water_uv, lava_uv, water_flow_uv, lava_flow_uv, crack_uv, items, components, gui, sound_types: sound_types(), sound_events, entities, lang, menus })
+    }
+}
+
+/// Reads files from the downloaded asset index (`assets/indexes`, `assets/objects`) next to the version's jar
+/// (`<data>/versions/<id>/<id>.jar`). Missing index means no assets.
+fn asset_reader(jar_path: &Path) -> impl Fn(&str) -> Option<Vec<u8>> {
+    let data = jar_path.parent().and_then(Path::parent).and_then(Path::parent).map(Path::to_path_buf).unwrap_or_default();
+    let version = jar_path.with_extension("json");
+    let objects: HashMap<String, String> = (|| {
+        let v: Value = serde_json::from_slice(&fs::read(&version).ok()?).ok()?;
+        let id = v["assetIndex"]["id"].as_str()?;
+        let index: Value = serde_json::from_slice(&fs::read(data.join("assets/indexes").join(format!("{id}.json"))).ok()?).ok()?;
+        Some(index["objects"].as_object()?.iter().filter_map(|(k, o)| Some((k.clone(), o["hash"].as_str()?.to_string()))).collect())
+    })()
+    .unwrap_or_default();
+    move |name: &str| {
+        let hash = objects.get(name)?;
+        fs::read(data.join("assets/objects").join(&hash[..2]).join(hash)).ok()
     }
 }
