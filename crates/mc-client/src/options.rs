@@ -124,6 +124,9 @@ pub struct Options {
     pub chat_scale: f32,
     pub hide_splashes: bool,
     pub attack_indicator: bool,
+    /// Built-in performance mod: skip sections hidden behind terrain, and entities off screen or hidden.
+    pub cave_culling: bool,
+    pub entity_culling: bool,
     pub keys: Vec<KeyCode>,
     pub last_server: String,
     #[allow(dead_code)]
@@ -151,6 +154,8 @@ impl Options {
             chat_scale: 1.0,
             hide_splashes: false,
             attack_indicator: true,
+            cave_culling: true,
+            entity_culling: true,
             keys: Action::ALL.iter().map(|a| a.info().2).collect(),
             last_server: String::new(),
             path,
@@ -184,6 +189,8 @@ impl Options {
                 "hideSplashTexts" => o.hide_splashes = b,
                 "attackIndicator" => o.attack_indicator = v != "0",
                 "lastServer" => o.last_server = v.to_string(),
+                "mcrs.caveCulling" => o.cave_culling = b,
+                "mcrs.entityCulling" => o.entity_culling = b,
                 _ => {
                     if let Some(cat) = k.strip_prefix("soundCategory_") {
                         if let Some(i) = category::NAMES.iter().position(|n| *n == cat) {
@@ -226,6 +233,8 @@ impl Options {
         put("hideSplashTexts", self.hide_splashes.to_string());
         put("attackIndicator", (self.attack_indicator as u8).to_string());
         put("lastServer", self.last_server.clone());
+        put("mcrs.caveCulling", self.cave_culling.to_string());
+        put("mcrs.entityCulling", self.entity_culling.to_string());
         for (i, v) in self.volumes.iter().enumerate() {
             put(&format!("soundCategory_{}", category::NAMES[i]), v.to_string());
         }

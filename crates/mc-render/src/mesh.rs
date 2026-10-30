@@ -54,13 +54,23 @@ impl Geometry {
     }
 }
 
+#[derive(Default)]
+pub struct SectionMesh {
+    pub opaque: Geometry,
+    pub translucent: Geometry,
+    /// Which faces see each other through non-opaque blocks: bit `a * 6 + b` (see [`crate::cull`]).
+    pub vis: u64,
+}
+
+/// Fresh meshes for some sections of a column.
 pub struct ChunkMesh {
     pub x: i32,
     pub z: i32,
-    pub min_y: f32,
-    pub max_y: f32,
-    pub opaque: Geometry,
-    pub translucent: Geometry,
+    pub min_section: i32,
+    /// Section count of the column.
+    pub height: usize,
+    /// (section index from the bottom, mesh).
+    pub sections: Vec<(usize, SectionMesh)>,
 }
 
 /// A chunk plus its 8 neighbors (any of which may not be loaded yet).
@@ -68,6 +78,8 @@ pub struct Area {
     pub center: Arc<Chunk>,
     /// Indexed `(dz + 1) * 3 + (dx + 1)`; the center slot is ignored.
     pub around: [Option<Arc<Chunk>>; 9],
+    /// Sections to mesh, bit i = section i from the bottom.
+    pub mask: u64,
 }
 
 impl Area {
@@ -140,14 +152,20 @@ fn axis(d: Dir) -> usize {
     }
 }
 
+/// Meshes the sections of `area.mask`. Every one of them gets an entry, so emptied sections replace old geometry.
 pub fn mesh_chunk(area: &Area, models: &BlockModels) -> ChunkMesh {
     let chunk = &*area.center;
     let (ox, oz) = (chunk.x as f32 * 16.0, chunk.z as f32 * 16.0);
-    let mut mesh = ChunkMesh { x: chunk.x, z: chunk.z, min_y: f32::MAX, max_y: f32::MIN, opaque: Geometry::default(), translucent: Geometry::default() };
+    let mut out = ChunkMesh { x: chunk.x, z: chunk.z, min_section: chunk.min_section, height: chunk.sections.len(), sections: Vec::new() };
     let opaque = |x: i32, y: i32, z: i32| area.block(x, y, z).is_some_and(|s| models.states[s as usize].opaque);
 
     for (si, section) in chunk.sections.iter().enumerate() {
+        if si >= 64 || area.mask & (1 << si) == 0 {
+            continue;
+        }
+        let mut mesh = SectionMesh { vis: crate::cull::visibility(section, models), ..Default::default() };
         if section.is_air() {
+            out.sections.push((si, mesh));
             continue;
         }
         let base_y = (chunk.min_section + si as i32) * 16;
@@ -161,7 +179,6 @@ pub fn mesh_chunk(area: &Area, models: &BlockModels) -> ChunkMesh {
                     }
                     let Some(model) = models.states.get(state as usize) else { continue };
                     let (wx, wy, wz) = (ox + x as f32, y as f32, oz + z as f32);
-                    let mut emitted = false;
 
                     for q in model.quads.iter() {
                         if let Some(dir) = q.cull {
@@ -187,21 +204,17 @@ pub fn mesh_chunk(area: &Area, models: &BlockModels) -> ChunkMesh {
                         let pos = q.pos.map(|p| [p[0] + wx, p[1] + wy, p[2] + wz]);
                         let target = if q.translucent { &mut mesh.translucent } else { &mut mesh.opaque };
                         target.quad(pos, q.uv, colors);
-                        emitted = true;
                     }
 
                     if let Some(fluid) = model.fluid {
-                        emitted |= fluid_faces(&mut mesh, area, models, fluid, [x, y, z], [wx, wy, wz]);
-                    }
-                    if emitted {
-                        mesh.min_y = mesh.min_y.min(wy);
-                        mesh.max_y = mesh.max_y.max(wy + 1.0);
+                        fluid_faces(&mut mesh, area, models, fluid, [x, y, z], [wx, wy, wz]);
                     }
                 }
             }
         }
+        out.sections.push((si, mesh));
     }
-    mesh
+    out
 }
 
 /// Per-vertex light and AO for a quad lying on a block face, sampled from the blocks in front of it.
@@ -243,7 +256,7 @@ fn smooth(area: &Area, opaque: &impl Fn(i32, i32, i32) -> bool, q: &Quad, dir: D
     out
 }
 
-fn fluid_faces(mesh: &mut ChunkMesh, area: &Area, models: &BlockModels, fluid: Fluid, [x, y, z]: [i32; 3], [wx, wy, wz]: [f32; 3]) -> bool {
+fn fluid_faces(mesh: &mut SectionMesh, area: &Area, models: &BlockModels, fluid: Fluid, [x, y, z]: [i32; 3], [wx, wy, wz]: [f32; 3]) {
     let same = |s: u16| models.states[s as usize].fluid == Some(fluid);
     let is_fluid = |x: i32, y: i32, z: i32| area.block(x, y, z).is_some_and(same);
     // FluidState.getOwnHeight: amount / 9, where a source or falling fluid has amount 8 and flowing 8 - level.
@@ -291,7 +304,6 @@ fn fluid_faces(mesh: &mut ChunkMesh, area: &Area, models: &BlockModels, fluid: F
         };
         flow_dir = [flow_dir[0] + dx as f32 * diff, flow_dir[1] + dz as f32 * diff];
     }
-    let mut any = false;
     for dir in Dir::ALL {
         let [dx, dy, dz] = dir.offset();
         let hidden = match area.block(x + dx, y + dy, z + dz) {
@@ -350,7 +362,5 @@ fn fluid_faces(mesh: &mut ChunkMesh, area: &Area, models: &BlockModels, fluid: F
             }
             Fluid::Lava => mesh.opaque.quad(pos, uv, [c; 4]),
         }
-        any = true;
     }
-    any
 }

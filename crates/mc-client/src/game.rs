@@ -19,7 +19,7 @@ use glam::{Mat4, Vec3};
 use mc_assets::BlockModels;
 use mc_render::{Area, ChunkMesh, LineVertex, Overlay, Renderer};
 use mc_world::Chunk;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -177,8 +177,10 @@ pub struct Game {
     jobs: Sender<(u64, Area)>,
     meshes: Receiver<(u64, ChunkMesh)>,
     world: HashMap<(i32, i32), Arc<Chunk>>,
-    versions: HashMap<(i32, i32), u64>,
-    dirty: HashSet<(i32, i32)>,
+    /// Newest mesh job per column and the sections it covers (including those of jobs it superseded).
+    versions: HashMap<(i32, i32), (u64, u64)>,
+    /// Sections waiting to be remeshed, bit i = section i from the bottom.
+    dirty: HashMap<(i32, i32), u64>,
     next_version: u64,
     pub cam: Camera,
     pub mode: Mode,
@@ -330,7 +332,7 @@ impl Game {
             meshes,
             world: HashMap::new(),
             versions: HashMap::new(),
-            dirty: HashSet::new(),
+            dirty: HashMap::new(),
             next_version: 0,
             cam: Camera { eye: [0.0, 80.0, 0.0], yaw: 0.0, pitch: 20.0 },
             mode: Mode::Walk,
@@ -422,17 +424,25 @@ impl Game {
         self.in_world && self.loaded_at.is_some_and(|t| t.elapsed() > Duration::from_millis(400))
     }
 
-    fn mark_around(&mut self, x: i32, z: i32) {
+    pub(super) fn mark(&mut self, x: i32, z: i32, sections: u64) {
+        *self.dirty.entry((x, z)).or_insert(0) |= sections;
+    }
+
+    /// Marks `sections` of a column and its 8 neighbors, whose border faces and light depend on it.
+    fn mark_around(&mut self, x: i32, z: i32, sections: u64) {
         for dz in -1..=1 {
             for dx in -1..=1 {
-                self.dirty.insert((x + dx, z + dz));
+                self.mark(x + dx, z + dz, sections);
             }
         }
     }
 
-    /// Sends every dirty, loaded chunk to the meshers along with its neighbors.
+    /// Sends every dirty, loaded chunk to the meshers along with its neighbors, nearest first.
     fn dispatch(&mut self) {
-        for key in std::mem::take(&mut self.dirty) {
+        let mut dirty: Vec<_> = std::mem::take(&mut self.dirty).into_iter().collect();
+        let (px, pz) = ((self.cam.eye[0] / 16.0).floor() as i32, (self.cam.eye[2] / 16.0).floor() as i32);
+        dirty.sort_by_key(|((x, z), _)| (x - px).abs().max((z - pz).abs()));
+        for (key, mut mask) in dirty {
             let Some(center) = self.world.get(&key).cloned() else { continue };
             let mut around: [Option<Arc<Chunk>>; 9] = Default::default();
             for dz in -1..=1 {
@@ -442,9 +452,13 @@ impl Game {
                     }
                 }
             }
+            // A job still in flight gets superseded, so this one must cover its sections too.
+            if let Some((_, pending)) = self.versions.get(&key) {
+                mask |= pending;
+            }
             self.next_version += 1;
-            self.versions.insert(key, self.next_version);
-            let _ = self.jobs.send((self.next_version, Area { center, around }));
+            self.versions.insert(key, (self.next_version, mask));
+            let _ = self.jobs.send((self.next_version, Area { center, around, mask }));
         }
     }
 
@@ -508,7 +522,7 @@ impl Game {
                     let key = (c.x, c.z);
                     self.world.insert(key, Arc::new(c));
                     // Neighbors can now cull their border faces and smooth their border light.
-                    self.mark_around(key.0, key.1);
+                    self.mark_around(key.0, key.1, u64::MAX);
                 }
                 Event::Forget(x, z) => {
                     self.world.remove(&(x, z));
@@ -519,8 +533,9 @@ impl Game {
                 Event::Light(x, z, light) => {
                     if let Some(chunk) = self.world.get_mut(&(x, z)) {
                         let sections = chunk.light_sections();
+                        let changed = light.block_sections();
                         Arc::make_mut(chunk).light.apply(light, sections);
-                        self.mark_around(x, z);
+                        self.mark_around(x, z, changed);
                     }
                 }
                 Event::Teleport(feet, rot, id) => {
@@ -707,8 +722,13 @@ impl Game {
             for (x, z) in std::mem::take(&mut self.forget) {
                 r.remove(x, z);
             }
-            while let Ok((version, mesh)) = self.meshes.try_recv() {
-                if self.versions.get(&(mesh.x, mesh.z)) == Some(&version) {
+            // A few milliseconds of uploads per frame; the rest wait so a burst of new chunks doesn't stall a frame.
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(4) {
+                let Ok((version, mesh)) = self.meshes.try_recv() else { break };
+                let key = (mesh.x, mesh.z);
+                if self.versions.get(&key).is_some_and(|v| v.0 == version) {
+                    self.versions.remove(&key);
                     r.upload(&mesh);
                 }
             }

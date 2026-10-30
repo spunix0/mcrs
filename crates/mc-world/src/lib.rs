@@ -67,6 +67,16 @@ fn bit(mask: &[u8], i: usize) -> bool {
     mask.get(i / 8).is_some_and(|b| (b >> (i % 8)) & 1 != 0)
 }
 
+impl LightUpdate {
+    /// Block sections whose meshes this update changes: light section i is block section i - 1, and smooth
+    /// lighting reads one block past each face, so the sections above and below count too.
+    pub fn block_sections(&self) -> u64 {
+        let masks = [&self.sky_mask, &self.block_mask, &self.empty_sky, &self.empty_block];
+        let light = (0..64).filter(|i| masks.iter().any(|m| bit(m, *i))).fold(0u64, |m, i| m | 1 << i);
+        light | light >> 1 | light >> 2
+    }
+}
+
 impl Light {
     fn apply_layer(layer: &mut Vec<Option<Nibbles>>, count: usize, mask: &[u8], empty: &[u8], data: Vec<Nibbles>) {
         layer.resize_with(count, || None);

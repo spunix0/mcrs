@@ -26,17 +26,26 @@ impl Game {
             let Some(chunk) = self.world.get_mut(&(cx, cz)) else { continue };
             let (lx, lz) = (x.rem_euclid(16), z.rem_euclid(16));
             Arc::make_mut(chunk).set(lx as usize, y, lz as usize, state);
+            let si = y.div_euclid(16) - chunk.min_section;
             let placed = self.pending_place.is_some_and(|(p, t)| p == [x, y, z] && t.elapsed() < Duration::from_secs(1));
             if placed && state != 0 {
                 self.pending_place = None;
                 self.block_sound([x, y, z], Some(state), |s| &s.place, |v| (v + 1.0) / 2.0, 0.8);
             }
-            // A block affects meshes of every chunk whose 1-block border it sits in.
+            // A block affects meshes of every section whose 1-block border it sits in.
+            let ly = y.rem_euclid(16);
+            let mut sections = 0u64;
+            for s in [si - 1, si, si + 1] {
+                let near = s == si || (s < si && ly == 0) || (s > si && ly == 15);
+                if near && (0..64).contains(&s) {
+                    sections |= 1 << s;
+                }
+            }
             let xs = [-1, 0, 1].into_iter().filter(|d| *d == 0 || (*d == -1 && lx == 0) || (*d == 1 && lx == 15));
             for dx in xs {
                 for dz in [-1, 0, 1] {
                     if dz == 0 || (dz == -1 && lz == 0) || (dz == 1 && lz == 15) {
-                        self.dirty.insert((cx + dx, cz + dz));
+                        self.mark(cx + dx, cz + dz, sections);
                     }
                 }
             }
@@ -548,8 +557,8 @@ impl Game {
         (proj * view, eye, hand)
     }
 
-    /// World-space geometry besides the chunks for this frame.
-    pub fn overlay(&mut self, o: &Options, hand_to_world: Mat4) -> Overlay {
+    /// World-space geometry besides the chunks for this frame. `visible` culls entities (see [`entities::mesh`]).
+    pub fn overlay(&mut self, o: &Options, hand_to_world: Mat4, visible: &dyn Fn(Vec3, Vec3) -> bool) -> Overlay {
         let mut ov = Overlay::default();
         let now = Instant::now();
         let env = self.sky.environment(o.gamma);
@@ -563,7 +572,7 @@ impl Game {
                 mc_render::brightness(s as f32, b as f32, &env)
             })
         };
-        entities::mesh(&mut self.entities, &models, now, light_fn, &mut ov.entities, &mut ov.entity_items, me);
+        entities::mesh(&mut self.entities, &models, now, light_fn, &mut ov.entities, &mut ov.entity_items, me, visible);
 
         let eye = Vec3::new(self.cam.eye[0] as f32, self.cam.eye[1] as f32, self.cam.eye[2] as f32);
         if self.eye_fluid().is_none() {

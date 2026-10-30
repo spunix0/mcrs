@@ -649,7 +649,8 @@ impl App {
             let (vp, e, hand) = g.camera(aspect, &self.options);
             (view_proj, eye) = (vp, e);
             env = g.environment(&self.options);
-            overlay = g.overlay(&self.options, hand);
+            let r = self.renderer.as_ref();
+            overlay = g.overlay(&self.options, hand, &|min, max| r.is_none_or(|r| r.entity_visible(&vp, min, max)));
             if !self.hide_hud {
                 g.hud(&mut painter, &self.options, show_tab);
             } else {
@@ -693,6 +694,7 @@ impl App {
         self.apply_options();
 
         if let Some(r) = &mut self.renderer {
+            (r.cave_culling, r.entity_culling) = (self.options.cave_culling, self.options.entity_culling);
             let fog_end = self.options.render_distance as f32 * 16.0;
             let stats = r.render(view_proj, eye, fog_end, &env, &overlay, &gui, in_world);
             if let Some(g) = &mut self.game {
@@ -707,6 +709,10 @@ impl App {
         if self.fps_since.elapsed() >= Duration::from_secs(1) {
             self.fps = self.frames as f32 / self.fps_since.elapsed().as_secs_f32();
             self.frames = 0;
+            if let Some(g) = self.game.as_ref().filter(|_| std::env::var_os("MCRS_DEBUG_STATS").is_some()) {
+                let (drawn, loaded, tris, _) = g.stats;
+                println!("fps {:.0}, sections {drawn}/{loaded}, {tris} triangles, cave culling {}", self.fps, self.options.cave_culling);
+            }
             self.fps_since = Instant::now();
             if let Some(win) = &self.window {
                 let mode = if self.game.is_none() { "" } else if self.singleplayer { " - Singleplayer" } else { " - Multiplayer (3rd-party Server)" };

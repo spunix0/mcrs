@@ -236,7 +236,9 @@ const DYE: [[u8; 3]; 16] = [
 ];
 
 /// Builds this frame's entity geometry: `skins` uses the GUI atlas, `items` the block atlas.
-pub fn mesh(entities: &mut Entities, models: &BlockModels, now: Instant, light_at: impl Fn([f64; 3]) -> f32, skins: &mut Vec<Vertex>, items: &mut Vec<Vertex>, skip: Option<i32>) {
+/// `visible(min, max)` is entity culling: entities whose box (with room for swinging limbs) fails it are skipped.
+#[allow(clippy::too_many_arguments)]
+pub fn mesh(entities: &mut Entities, models: &BlockModels, now: Instant, light_at: impl Fn([f64; 3]) -> f32, skins: &mut Vec<Vertex>, items: &mut Vec<Vertex>, skip: Option<i32>, visible: &dyn Fn(Vec3, Vec3) -> bool) {
     let Entities { map, mobs } = entities;
     for (id, e) in map.iter() {
         if Some(*id) == skip {
@@ -244,8 +246,12 @@ pub fn mesh(entities: &mut Entities, models: &BlockModels, now: Instant, light_a
         }
         let Some(info) = models.entities.get(e.kind as usize) else { continue };
         let [x, y, z] = e.render_pos(now);
-        let light = light_at([x, y + 0.5, z]);
         let origin = Vec3::new(x as f32, y as f32, z as f32);
+        let half = info.width / 2.0 + 0.5;
+        if !visible(origin - Vec3::new(half, 0.5, half), origin + Vec3::new(half, info.height + 0.5, half)) {
+            continue;
+        }
+        let light = light_at([x, y + 0.5, z]);
         let age = now.duration_since(e.spawned).as_secs_f32() * 20.0;
         match info.name.as_str() {
             "item" => {

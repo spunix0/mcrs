@@ -658,6 +658,10 @@ pub fn run(screen: &mut Screen, ui: &mut Ui, ctx: &mut Ctx) -> Action {
                 o.fov = 30.0 + fov * 80.0;
                 changed = true;
             }
+            i += 1;
+            changed |= ui.toggle("Cave Culling", &mut o.cave_culling, col(i), row(i), 150.0);
+            i += 1;
+            changed |= ui.toggle("Entity Culling", &mut o.entity_culling, col(i), row(i), 150.0);
             if ui.button("Done", cx - 100.0, h - 27.0, 200.0, 20.0, true) || back {
                 return Action::Pop;
             }

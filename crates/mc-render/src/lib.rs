@@ -1,5 +1,6 @@
-﻿//! wgpu renderer: chunk meshing, GPU buffers, culling, indirect draws. The crate where the performance goal is won.
+﻿//! wgpu renderer: chunk meshing, GPU buffers, frustum and cave culling. The crate where the performance goal is won.
 
+mod cull;
 mod gui;
 mod mesh;
 
@@ -10,7 +11,7 @@ use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 use mc_assets::{Atlas, GuiAtlas};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use wgpu::util::DeviceExt;
 
 const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -73,17 +74,32 @@ impl GpuMesh {
     }
 }
 
-impl GpuChunk {
-    fn bytes(&self) -> u64 {
-        self.opaque.as_ref().map_or(0, GpuMesh::bytes) + self.translucent.as_ref().map_or(0, GpuMesh::bytes)
+struct GpuSection {
+    opaque: Option<GpuMesh>,
+    translucent: Option<GpuMesh>,
+    /// Face-to-face visibility for cave culling.
+    vis: u64,
+}
+
+impl Default for GpuSection {
+    fn default() -> Self {
+        Self { opaque: None, translucent: None, vis: cull::ALL }
     }
 }
 
-struct GpuChunk {
-    opaque: Option<GpuMesh>,
-    translucent: Option<GpuMesh>,
-    min: Vec3,
-    max: Vec3,
+impl GpuSection {
+    fn bytes(&self) -> u64 {
+        self.opaque.as_ref().map_or(0, GpuMesh::bytes) + self.translucent.as_ref().map_or(0, GpuMesh::bytes)
+    }
+
+    fn triangles(&self) -> u64 {
+        (self.opaque.as_ref().map_or(0, |m| m.count) + self.translucent.as_ref().map_or(0, |m| m.count)) as u64 / 3
+    }
+}
+
+struct GpuColumn {
+    min_section: i32,
+    sections: Vec<GpuSection>,
 }
 
 /// A vertex of the line overlay (block outline, crosshair).
@@ -185,8 +201,14 @@ pub struct Renderer {
     entity_buffer: DynBuffer,
     entity_item_buffer: DynBuffer,
     celestial_buffer: DynBuffer,
-    chunks: HashMap<(i32, i32), GpuChunk>,
+    chunks: HashMap<(i32, i32), GpuColumn>,
     gpu_bytes: u64,
+    /// Skip sections hidden behind terrain (and the entities in them).
+    pub cave_culling: bool,
+    /// Skip entities outside the view or in sections cave culling hid.
+    pub entity_culling: bool,
+    /// The sections cave culling reached last frame, for [`Renderer::entity_visible`].
+    reached: Option<HashSet<[i32; 3]>>,
     pub adapter_name: String,
     block_texture: wgpu::Texture,
     /// Frame each animated texture shows now.
@@ -476,6 +498,9 @@ impl Renderer {
             uniforms,
             chunks: HashMap::new(),
             gpu_bytes: 0,
+            cave_culling: true,
+            entity_culling: true,
+            reached: None,
             adapter_name,
             anim_frames: vec![0; atlas.animations.len()],
             block_texture,
@@ -506,22 +531,36 @@ impl Renderer {
     }
 
     pub fn upload(&mut self, mesh: &ChunkMesh) {
-        let gpu = GpuChunk {
-            opaque: upload(&self.device, &mesh.opaque),
-            translucent: upload(&self.device, &mesh.translucent),
-            min: Vec3::new(mesh.x as f32 * 16.0, mesh.min_y, mesh.z as f32 * 16.0),
-            max: Vec3::new(mesh.x as f32 * 16.0 + 16.0, mesh.max_y, mesh.z as f32 * 16.0 + 16.0),
-        };
-        self.gpu_bytes += gpu.bytes();
-        if let Some(old) = self.chunks.insert((mesh.x, mesh.z), gpu) {
-            self.gpu_bytes -= old.bytes();
+        let fresh = || GpuColumn { min_section: mesh.min_section, sections: (0..mesh.height).map(|_| GpuSection::default()).collect() };
+        let column = self.chunks.entry((mesh.x, mesh.z)).or_insert_with(fresh);
+        if column.min_section != mesh.min_section || column.sections.len() != mesh.height {
+            self.gpu_bytes -= column.sections.iter().map(GpuSection::bytes).sum::<u64>();
+            *column = fresh();
+        }
+        for (i, s) in &mesh.sections {
+            let gpu = GpuSection { opaque: upload(&self.device, &s.opaque), translucent: upload(&self.device, &s.translucent), vis: s.vis };
+            self.gpu_bytes += gpu.bytes();
+            self.gpu_bytes -= std::mem::replace(&mut column.sections[*i], gpu).bytes();
         }
     }
 
     pub fn remove(&mut self, x: i32, z: i32) {
         if let Some(old) = self.chunks.remove(&(x, z)) {
-            self.gpu_bytes -= old.bytes();
+            self.gpu_bytes -= old.sections.iter().map(GpuSection::bytes).sum::<u64>();
         }
+    }
+
+    /// Whether an entity box is on screen: inside the view and, with cave culling, in a section last frame reached.
+    pub fn entity_visible(&self, view_proj: &Mat4, min: Vec3, max: Vec3) -> bool {
+        if !self.entity_culling {
+            return true;
+        }
+        if !visible(view_proj, min, max) {
+            return false;
+        }
+        let Some(reached) = &self.reached else { return true };
+        let s = |v: f32| (v.floor() as i32).div_euclid(16);
+        (s(min.x)..=s(max.x)).any(|x| (s(min.y)..=s(max.y)).any(|y| (s(min.z)..=s(max.z)).any(|z| reached.contains(&[x, y, z]))))
     }
 
     /// Drops every chunk mesh (leaving a world or changing dimension).
@@ -532,7 +571,8 @@ impl Renderer {
 
     /// Draws one frame. Without `world` only the GUI is drawn (menus outside a world).
     pub fn render(&mut self, view_proj: Mat4, camera: Vec3, fog_end: f32, env: &Environment, overlay: &Overlay, gui: &Gui, world: bool) -> FrameStats {
-        let mut stats = FrameStats { drawn: 0, loaded: self.chunks.len(), triangles: 0, gpu_bytes: self.gpu_bytes };
+        let loaded = self.chunks.values().flat_map(|c| &c.sections).filter(|s| s.opaque.is_some() || s.translucent.is_some()).count();
+        let mut stats = FrameStats { drawn: 0, loaded, triangles: 0, gpu_bytes: self.gpu_bytes };
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
@@ -572,20 +612,43 @@ impl Renderer {
         let hand_count = self.hand_buffer.write(device, queue, &hand);
         let gui_count = self.gui_buffer.write(device, queue, &gui.vertices);
 
-        let mut visible_chunks: Vec<(&GpuChunk, f32)> = if world {
-            self.chunks
-                .values()
-                .filter(|c| c.min.y <= c.max.y && visible(&view_proj, c.min, c.max))
-                .map(|c| (c, ((c.min + c.max) * 0.5).distance_squared(camera)))
-                .collect()
-        } else {
-            Vec::new()
+        let bounds = |p: [i32; 3]| {
+            let min = Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32) * 16.0;
+            (min, min + Vec3::splat(16.0))
         };
-        stats.drawn = visible_chunks.len();
-        stats.triangles = visible_chunks
+        let in_view = |p: [i32; 3]| {
+            let (min, max) = bounds(p);
+            visible(&view_proj, min, max)
+        };
+        let section_at = |p: [i32; 3]| {
+            let c = self.chunks.get(&(p[0], p[2]))?;
+            c.sections.get(usize::try_from(p[1] - c.min_section).ok()?)
+        };
+        let candidates: Vec<[i32; 3]> = if !world {
+            Vec::new()
+        } else if self.cave_culling {
+            let (cx, cz) = ((camera.x / 16.0).floor() as i32, (camera.z / 16.0).floor() as i32);
+            let radius = self.chunks.keys().map(|k| (k.0 - cx).abs().max((k.1 - cz).abs())).max().unwrap_or(0);
+            let range = self.chunks.values().next().map_or((0, -1), |c| (c.min_section, c.min_section + c.sections.len() as i32 - 1));
+            cull::search(camera, radius, range, |x, y, z| section_at([x, y, z]).map(|s| s.vis), in_view)
+        } else {
+            self.chunks
+                .iter()
+                .flat_map(|(k, c)| (0..c.sections.len() as i32).map(move |i| [k.0, c.min_section + i, k.1]))
+                .filter(|p| in_view(*p))
+                .collect()
+        };
+        let mut visible_chunks: Vec<(&GpuSection, f32)> = candidates
             .iter()
-            .map(|(c, _)| (c.opaque.as_ref().map_or(0, |m| m.count) + c.translucent.as_ref().map_or(0, |m| m.count)) as u64 / 3)
-            .sum();
+            .filter_map(|p| {
+                let s = section_at(*p).filter(|s| s.opaque.is_some() || s.translucent.is_some())?;
+                let (min, max) = bounds(*p);
+                Some((s, ((min + max) * 0.5).distance_squared(camera)))
+            })
+            .collect();
+        self.reached = (world && self.cave_culling).then(|| candidates.into_iter().collect());
+        stats.drawn = visible_chunks.len();
+        stats.triangles = visible_chunks.iter().map(|(s, _)| s.triangles()).sum();
         // Near-to-far for opaque (early depth rejects), far-to-near for translucent blending.
         visible_chunks.sort_by(|a, b| a.1.total_cmp(&b.1));
 
