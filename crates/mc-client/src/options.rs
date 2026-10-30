@@ -127,6 +127,8 @@ pub struct Options {
     /// Built-in performance mod: skip sections hidden behind terrain, and entities off screen or hidden.
     pub cave_culling: bool,
     pub entity_culling: bool,
+    pub pause_on_lost_focus: bool,
+    pub fps_graph: bool,
     pub keys: Vec<KeyCode>,
     pub last_server: String,
     #[allow(dead_code)]
@@ -156,6 +158,8 @@ impl Options {
             attack_indicator: true,
             cave_culling: true,
             entity_culling: true,
+            pause_on_lost_focus: true,
+            fps_graph: true,
             keys: Action::ALL.iter().map(|a| a.info().2).collect(),
             last_server: String::new(),
             path,
@@ -191,6 +195,8 @@ impl Options {
                 "lastServer" => o.last_server = v.to_string(),
                 "mcrs.caveCulling" => o.cave_culling = b,
                 "mcrs.entityCulling" => o.entity_culling = b,
+                "pauseOnLostFocus" => o.pause_on_lost_focus = b,
+                "mcrs.fpsGraph" => o.fps_graph = b,
                 _ => {
                     if let Some(cat) = k.strip_prefix("soundCategory_") {
                         if let Some(i) = category::NAMES.iter().position(|n| *n == cat) {
@@ -235,6 +241,8 @@ impl Options {
         put("lastServer", self.last_server.clone());
         put("mcrs.caveCulling", self.cave_culling.to_string());
         put("mcrs.entityCulling", self.entity_culling.to_string());
+        put("pauseOnLostFocus", self.pause_on_lost_focus.to_string());
+        put("mcrs.fpsGraph", self.fps_graph.to_string());
         for (i, v) in self.volumes.iter().enumerate() {
             put(&format!("soundCategory_{}", category::NAMES[i]), v.to_string());
         }

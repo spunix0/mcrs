@@ -118,6 +118,10 @@ pub struct StateModel {
     pub collision: Arc<Vec<[f32; 6]>>,
     /// Ground slipperiness (0.6 for most blocks).
     pub friction: f32,
+    /// Light the block gives off, 0..15.
+    pub light: u8,
+    /// How much light it takes away passing through (vanilla `getLightBlock`): 15 opaque, 1 water and leaves.
+    pub light_block: u8,
     /// Mining hardness (vanilla `destroyTime`); negative means unbreakable.
     pub hardness: f32,
     /// Drops only with the right tool; bare hands then mine 3.3x slower.
@@ -200,6 +204,39 @@ fn sound_types() -> HashMap<String, SoundSet> {
             ))
         })
         .collect()
+}
+
+/// Light a block state gives off (vanilla `lightEmission`), from the rules `tools/light.pl` extracted from Blocks.java.
+fn light_emission(table: &HashMap<&str, &str>, block: &str, props: &[(String, String)]) -> u8 {
+    let prop = |k: &str| props.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    let num = |k: &str| prop(k).and_then(|v| v.parse::<u8>().ok()).unwrap_or(0);
+    let lit = prop("lit") == Some("true");
+    // Blocks registered in loops the extractor can't follow.
+    let rule = table.get(block).copied().or_else(|| {
+        Some(if block.ends_with("_candle_cake") {
+            "lit:3"
+        } else if block.ends_with("_candle") {
+            "candle"
+        } else if block.contains("copper_lantern") {
+            "15"
+        } else if block.ends_with("copper_bulb") {
+            if block.contains("oxidized") { "lit:4" } else if block.contains("weathered") { "lit:8" } else if block.contains("exposed") { "lit:12" } else { "lit:15" }
+        } else {
+            return None;
+        })
+    });
+    match rule {
+        None => 0,
+        Some("candle") => if lit { 3 * num("candles") } else { 0 },
+        Some("level") => num("level"),
+        Some("pickle") => if prop("waterlogged") == Some("true") { 3 + 3 * num("pickles") } else { 0 },
+        Some("anchor") => [0, 3, 7, 11, 15][num("charges").min(4) as usize],
+        Some(r) => match r.split_once(':') {
+            Some(("lit", n)) => if lit { n.parse().unwrap_or(0) } else { 0 },
+            Some(("berries", n)) => if prop("berries") == Some("true") { n.parse().unwrap_or(0) } else { 0 },
+            _ => r.parse().unwrap_or(0),
+        },
+    }
 }
 
 /// `block -> (hardness, needs correct tool)`, extracted from 26.3's Blocks.java by `tools/hardness.pl`.
@@ -355,6 +392,9 @@ pub struct BlockModels {
     pub lava_flow_uv: [f32; 4],
     /// Block-breaking crack textures, stage 0 to 9.
     pub crack_uv: [[f32; 4]; 10],
+    /// Particle animation frames: the explosion puff (16) and generic smoke (8).
+    pub explosion_uv: Vec<[f32; 4]>,
+    pub smoke_uv: Vec<[f32; 4]>,
     /// Indexed by item protocol ID.
     pub items: Vec<ItemInfo>,
     /// Data component type name (without `minecraft:`) to protocol ID.
@@ -389,7 +429,7 @@ fn load_registry(v: &Value, registry: &str) -> Vec<String> {
 fn item_tint(item: &str) -> Option<[u8; 3]> {
     match item {
         "short_grass" | "tall_grass" | "fern" | "large_fern" | "sugar_cane" => Some(GRASS),
-        "lily_pad" | "vine" | "birch_leaves" | "spruce_leaves" => Some(tint_for(item)),
+        "lily_pad" | "vine" | "birch_leaves" | "spruce_leaves" => Some(tint_for(item, &[])),
         i if i.ends_with("_leaves") && !matches!(i, "cherry_leaves" | "azalea_leaves" | "flowering_azalea_leaves" | "pale_oak_leaves") => {
             Some(FOLIAGE)
         }
@@ -454,14 +494,31 @@ const FOLIAGE: [u8; 3] = [0x77, 0xab, 0x2f];
 const WATER: [u8; 3] = [0x3f, 0x76, 0xe4];
 
 /// Plains-biome colors; real biome blending comes later.
-fn tint_for(block: &str) -> [u8; 3] {
+/// Vanilla's `BlockColors`: only these blocks are tinted; every other tinted face stays white.
+fn tint_for(block: &str, props: &[(String, String)]) -> [u8; 3] {
+    let num = |k: &str| props.iter().find(|(n, _)| n == k).and_then(|(_, v)| v.parse::<f32>().ok()).unwrap_or(0.0);
     match block {
+        "grass_block" | "short_grass" | "tall_grass" | "fern" | "large_fern" | "potted_fern" | "bush" | "pink_petals" | "wildflowers" | "sugar_cane" => GRASS,
         "birch_leaves" => [0x80, 0xa7, 0x55],
         "spruce_leaves" => [0x61, 0x99, 0x61],
         "lily_pad" => [0x20, 0x80, 0x30],
-        "water" | "bubble_column" => WATER,
-        b if b.ends_with("leaves") || b == "vine" => FOLIAGE,
-        _ => GRASS,
+        "oak_leaves" | "jungle_leaves" | "acacia_leaves" | "dark_oak_leaves" | "mangrove_leaves" | "vine" => FOLIAGE,
+        "leaf_litter" => [0x5c, 0x3c, 0x32],
+        "water" | "bubble_column" | "water_cauldron" => WATER,
+        "attached_melon_stem" | "attached_pumpkin_stem" => [0xe0, 0xc7, 0x1c],
+        "melon_stem" | "pumpkin_stem" => {
+            let age = num("age");
+            [(age * 32.0) as u8, (255.0 - age * 8.0) as u8, (age * 4.0) as u8]
+        }
+        "redstone_wire" => {
+            // RedStoneWireBlock.getColorForPower.
+            let f = num("power") / 15.0;
+            let r = f * 0.6 + if f > 0.0 { 0.4 } else { 0.3 };
+            let g = (f * f * 0.7 - 0.5).clamp(0.0, 1.0);
+            let b = (f * f * 0.6 - 0.7).clamp(0.0, 1.0);
+            [(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8]
+        }
+        _ => [255; 3],
     }
 }
 
@@ -514,7 +571,7 @@ impl BlockModels {
                     icon,
                     block: def.as_ref().is_some_and(|d| d.elements_model.is_some()),
                     model,
-                    model_tint: tint_for(name),
+                    model_tint: tint_for(name, &[]),
                     hand: display("firstperson_righthand"),
                     gui: display("gui"),
                     ground: display("ground"),
@@ -533,8 +590,11 @@ impl BlockModels {
         let water_flow_uv = atlas.rect("minecraft:block/water_flow");
         let lava_flow_uv = atlas.rect("minecraft:block/lava_flow");
         let crack_uv = std::array::from_fn(|i| atlas.rect(&format!("minecraft:block/destroy_stage_{i}")));
+        let explosion_uv = (0..16).map(|i| atlas.rect(&format!("minecraft:particle/explosion_{i}"))).collect();
+        let smoke_uv = (0..8).map(|i| atlas.rect(&format!("minecraft:particle/generic_{i}"))).collect();
 
         let hardness = hardness_table();
+        let light: HashMap<&str, &str> = include_str!("../data/light.tsv").lines().filter_map(|l| l.split_once('\t')).collect();
         let tools = ToolRules::load(&mut jar);
         let mut names: HashMap<String, Arc<str>> = HashMap::new();
         let mut sounds: HashMap<String, Arc<str>> = HashMap::new();
@@ -546,7 +606,9 @@ impl BlockModels {
                 let mut boxes = Vec::new();
                 let mut opaque = false;
                 for p in &parts {
-                    quads.extend(p.quads.iter().map(|q| q.finish(&atlas)));
+                    // Pink petals and wildflowers: layer 0 (the flowers) is blank, layer 1 (the stems) grass.
+                    let layered = matches!(s.block.as_str(), "pink_petals" | "wildflowers");
+                    quads.extend(p.quads.iter().map(|q| Quad { tinted: q.tint.is_some() && (!layered || q.tint == Some(1)), ..q.finish(&atlas) }));
                     boxes.extend_from_slice(&p.boxes);
                     opaque |= p.full_cube && !p.textures.iter().any(|t| atlas.has_alpha(t));
                 }
@@ -563,9 +625,17 @@ impl BlockModels {
                     opaque: opaque && !is_air,
                     fluid,
                     fluid_level: s.props.iter().find(|(k, _)| k == "level").and_then(|(_, v)| v.parse().ok()).unwrap_or(0),
-                    tint: tint_for(&s.block),
+                    tint: tint_for(&s.block, &s.props),
                     collision: Arc::new(if is_air { Vec::new() } else { collision_for(&s.block, boxes) }),
                     friction: friction_for(&s.block),
+                    light: light_emission(&light, &s.block, &s.props),
+                    light_block: if opaque && !is_air || s.block == "tinted_glass" {
+                        15
+                    } else if fluid.is_some() || s.block.ends_with("_leaves") || matches!(s.block.as_str(), "ice" | "frosted_ice" | "slime_block" | "cobweb") {
+                        1
+                    } else {
+                        0
+                    },
                     hardness: hardness.get(s.block.as_str()).map_or(1.0, |h| h.0),
                     needs_tool: hardness.get(s.block.as_str()).is_some_and(|h| h.1),
                     mineable: tools.get(&s.block),
@@ -574,7 +644,7 @@ impl BlockModels {
                 }
             })
             .collect();
-        Ok(Self { states, atlas, water_uv, lava_uv, water_flow_uv, lava_flow_uv, crack_uv, items, components, gui, sound_types: sound_types(), sound_events, entities, lang, menus })
+        Ok(Self { states, atlas, water_uv, lava_uv, water_flow_uv, lava_flow_uv, crack_uv, explosion_uv, smoke_uv, items, components, gui, sound_types: sound_types(), sound_events, entities, lang, menus })
     }
 }
 
@@ -593,5 +663,39 @@ fn asset_reader(jar_path: &Path) -> impl Fn(&str) -> Option<Vec<u8>> {
     move |name: &str| {
         let hash = objects.get(name)?;
         fs::read(data.join("assets/objects").join(&hash[..2]).join(hash)).ok()
+    }
+}
+
+#[cfg(test)]
+mod audit {
+    use super::*;
+
+    /// Every item must have something to draw that isn't the missing-texture checker. Uses the installed game
+    /// (skipped when it isn't there); run with `--ignored --nocapture` to see the list.
+    #[test]
+    #[ignore = "62 block-entity items (chests, shulker boxes, heads, banners, shield, decorated pot, conduit, copper golem statues) have no model yet"]
+    fn every_item_has_its_textures() {
+        let data = std::path::PathBuf::from(std::env::var("USERPROFILE").unwrap_or_default()).join("mcrs").join("data");
+        let jar = data.join("versions/26.3/26.3.jar");
+        if !jar.exists() {
+            return;
+        }
+        let m = BlockModels::load(&jar, &data.join("reports")).unwrap();
+        let bad = m.atlas.rect("minecraft:missingno");
+        let in_bad = |uv: [f32; 2]| uv[0] >= bad[0] && uv[0] <= bad[2] && uv[1] >= bad[1] && uv[1] <= bad[3];
+        let mut problems = Vec::new();
+        for item in &m.items {
+            if item.name == "air" {
+                continue;
+            }
+            let checker = item.model.as_ref().is_some_and(|q| q.iter().any(|q| q.uv.iter().all(|uv| in_bad(*uv))));
+            let icon_bad = item.icon.is_some_and(|r| in_bad([r[0], r[1]]));
+            if (item.icon.is_none() && item.model.is_none()) || checker || icon_bad {
+                problems.push(format!("{} (icon {}, model {}{})", item.name, item.icon.is_some(), item.model.is_some(), if checker || icon_bad { ", checker" } else { "" }));
+            }
+        }
+        println!("unreadable textures: {:?}", m.atlas.missing);
+        println!("{} items with missing textures:\n{}", problems.len(), problems.join("\n"));
+        assert!(problems.is_empty() && m.atlas.missing.is_empty());
     }
 }

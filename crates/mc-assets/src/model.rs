@@ -131,7 +131,8 @@ pub struct PendingQuad {
     texture: String,
     cull: Option<Dir>,
     shade: f32,
-    tinted: bool,
+    /// The face's `tintindex`: which of the block's tint layers colors it.
+    pub(crate) tint: Option<i64>,
 }
 
 impl PendingQuad {
@@ -143,7 +144,7 @@ impl PendingQuad {
             uv: self.uv.map(map),
             cull: self.cull,
             shade: self.shade,
-            tinted: self.tinted,
+            tinted: self.tint.is_some(),
             translucent: atlas.is_translucent(&self.texture),
         }
     }
@@ -366,12 +367,14 @@ impl Baker {
                     for p in &mut pos {
                         *p = [p[0] / 16.0, p[1] / 16.0, p[2] / 16.0];
                     }
-                    let texture = self.texture(&model, face["texture"].as_str().unwrap_or("#missing"));
+                    // A face names a texture variable, with or without the leading `#` (BlockElementFace).
+                    let key = face["texture"].as_str().unwrap_or("missing");
+                    let texture = self.texture(&model, &format!("#{}", key.trim_start_matches('#')));
                     if is_full {
                         part.textures.push(texture.clone());
                     }
                     let shade = if !shade_el || shade_up { 1.0 } else { Dir::from_normal(normal(&pos)).shade() };
-                    part.quads.push(PendingQuad { pos, uv, texture, cull, shade, tinted: face.get("tintindex").is_some() });
+                    part.quads.push(PendingQuad { pos, uv, texture, cull, shade, tint: face.get("tintindex").and_then(|t| t.as_i64()) });
                 }
                 part.full_cube |= is_full;
                 let tilted = rot.is_some_and(|r| r["angle"].as_f64().unwrap_or(0.0) != 0.0);
@@ -442,7 +445,9 @@ impl Baker {
     pub fn stitch(&mut self, jar: &mut Jar) -> anyhow::Result<Atlas> {
         let fluids = ["water_still", "lava_still", "water_flow", "lava_flow"].map(|t| format!("minecraft:block/{t}"));
         let cracks = (0..10).map(|i| format!("minecraft:block/destroy_stage_{i}"));
-        for extra in fluids.into_iter().chain(cracks) {
+        // Particle sheets drawn from the block atlas: explosion puffs and smoke.
+        let particles = (0..16).map(|i| format!("minecraft:particle/explosion_{i}")).chain((0..8).map(|i| format!("minecraft:particle/generic_{i}")));
+        for extra in fluids.into_iter().chain(cracks).chain(particles) {
             if !self.texture_ids.contains_key(&extra) {
                 self.texture_ids.insert(extra.clone(), self.textures.len());
                 self.textures.push(extra);

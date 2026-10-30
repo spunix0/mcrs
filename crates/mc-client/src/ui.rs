@@ -1,6 +1,6 @@
 //! Immediate-mode widgets in vanilla's style (buttons, sliders, text fields, lists) on top of [`Painter`].
 //! Each frame a screen lays out its widgets; mouse, keyboard and the controller (D-pad / stick to move focus,
-//! A to press, B to go back) all drive them.
+//! A to press or grab a slider, B to go back) all drive them.
 
 use crate::hud::{self, Painter};
 use winit::keyboard::KeyCode;
@@ -23,6 +23,8 @@ pub struct Input {
     pub nav: Option<Nav>,
     pub accept: bool,
     pub back: bool,
+    /// How far this frame's stick moves a grabbed slider (0..1 of its range).
+    pub slide: f32,
     /// Last input came from the controller (show focus instead of hover).
     pub pad: bool,
 }
@@ -50,6 +52,9 @@ pub struct Focus {
     pub text: Option<usize>,
     /// Slider being dragged.
     pub dragging: Option<usize>,
+    /// Slider the controller grabbed with A (the stick moves it until A or B lets go), and its unrounded value.
+    pub grabbed: Option<usize>,
+    slide: f32,
     /// Rectangles of last frame's widgets, for moving focus spatially.
     rects: Vec<[f32; 4]>,
 }
@@ -70,8 +75,8 @@ fn inside(m: (f32, f32), x: f32, y: f32, w: f32, h: f32) -> bool {
 
 impl<'a, 'b> Ui<'a, 'b> {
     pub fn new(p: &'a mut Painter<'b>, input: &'a Input, focus: &'a mut Focus) -> Self {
-        // Move focus from last frame's layout.
-        if let Some(nav) = input.nav {
+        // Move focus from last frame's layout (not while a grabbed slider takes the stick).
+        if let Some(nav) = input.nav.filter(|_| focus.grabbed.is_none()) {
             focus.index = Some(match focus.index {
                 None => 0,
                 Some(i) => nearest(&focus.rects, i, nav).unwrap_or(i),
@@ -169,19 +174,30 @@ impl<'a, 'b> Ui<'a, 'b> {
         }
         if self.focus.index == Some(id) {
             let step = steps.map_or(0.01, |s| 1.0 / s.max(1) as f32);
-            if self.input.pressed(KeyCode::ArrowLeft) || (self.input.pad && self.input.nav == Some(Nav::Left)) {
+            if self.input.pressed(KeyCode::ArrowLeft) {
                 *value = (*value - step).max(0.0);
             }
-            if self.input.pressed(KeyCode::ArrowRight) || (self.input.pad && self.input.nav == Some(Nav::Right)) {
+            if self.input.pressed(KeyCode::ArrowRight) {
                 *value = (*value + step).min(1.0);
             }
+            if self.input.accept {
+                self.focus.grabbed = if self.focus.grabbed == Some(id) { None } else { Some(id) };
+                self.focus.slide = *value;
+                self.used = true;
+                click_sound();
+            }
+        }
+        if self.focus.grabbed == Some(id) {
+            self.focus.slide = (self.focus.slide + self.input.slide).clamp(0.0, 1.0);
+            *value = self.focus.slide;
         }
         if let Some(s) = steps {
             *value = (*value * s as f32).round() / s as f32;
         }
         self.p.nine_slice(if hot { "slider_highlighted" } else { "slider" }, x, y, w, h, 1.0);
         let hx = x + *value * (w - 8.0);
-        self.p.nine_slice(if hot || self.focus.dragging == Some(id) { "slider_handle_highlighted" } else { "slider_handle" }, hx, y, 8.0, h, 1.0);
+        let held = self.focus.dragging == Some(id) || self.focus.grabbed == Some(id);
+        self.p.nine_slice(if hot || held { "slider_handle_highlighted" } else { "slider_handle" }, hx, y, 8.0, h, 1.0);
         self.p.text_centered(text, x + w / 2.0, y + 6.0, hud::WHITE);
         *value != before
     }

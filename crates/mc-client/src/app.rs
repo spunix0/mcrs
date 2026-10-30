@@ -15,7 +15,7 @@ use gilrs::{Axis, Button, Gilrs};
 use glam::{Mat4, Vec3};
 use mc_assets::BlockModels;
 use mc_render::{Environment, Overlay, Renderer};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
@@ -111,6 +111,8 @@ pub struct App {
     hide_hud: bool,
     last_frame: Instant,
     frames: u32,
+    /// The last 120 frame times in milliseconds, for the FPS graph.
+    frame_times: std::collections::VecDeque<f32>,
     fps_since: Instant,
     fps: f32,
     first_frame: bool,
@@ -177,6 +179,7 @@ impl App {
             hide_hud: false,
             last_frame: Instant::now(),
             frames: 0,
+            frame_times: std::collections::VecDeque::new(),
             fps_since: Instant::now(),
             fps: 0.0,
             first_frame: false,
@@ -529,20 +532,29 @@ impl App {
             self.mouse_px.1 = (self.mouse_px.1 - pad.left[1] * PAD_CURSOR_SPEED * scale * dt).clamp(0.0, h as f32);
         }
         let nav = if !self.screens.is_empty() { self.pad_nav(&pad) } else { None };
+        // B lets go of a grabbed slider instead of closing the screen.
+        let release = self.focus.grabbed.is_some() && edge(pad.b, prev.b);
+        if release || self.screens.is_empty() {
+            self.focus.grabbed = None;
+        }
+        let slide_dir = (pad.left[0] + (pad.right_d as i32 - pad.left_d as i32) as f32).clamp(-1.0, 1.0);
         let mut input = Input {
             mouse: (self.mouse_px.0 / scale, self.mouse_px.1 / scale),
             clicked: self.clicked || (container_open && edge(pad.a, prev.a)),
             right_clicked: self.right_clicked || (container_open && edge(pad.x, prev.x)),
             held: self.mouse_left,
             double_click: self.double_click,
-            scroll: self.scroll,
+            // The right stick scrolls inventories (the creative grid) at up to 6 rows a second.
+            scroll: self.scroll + if container_open { pad.right[1] * dt * 6.0 } else { 0.0 },
             typed: std::mem::take(&mut self.typed),
             keys: std::mem::take(&mut self.pressed),
             shift: self.keys.contains(&KeyCode::ShiftLeft) || self.keys.contains(&KeyCode::ShiftRight),
             ctrl: self.keys.contains(&KeyCode::ControlLeft) || self.keys.contains(&KeyCode::ControlRight),
             nav,
             accept: !self.screens.is_empty() && edge(pad.a, prev.a),
-            back: !self.screens.is_empty() && edge(pad.b, prev.b),
+            back: !self.screens.is_empty() && edge(pad.b, prev.b) && !release,
+            // A full stick crosses a slider in two seconds.
+            slide: slide_dir * dt * 0.5,
             pad: self.pad_mode && !container_open,
         };
         if self.clicked {
@@ -569,7 +581,7 @@ impl App {
                     if edge(pad.rt, prev.rt) {
                         self.attack_pressed = true;
                     }
-                    if edge(pad.right_d, prev.right_d) {
+                    if edge(pad.b, prev.b) || edge(pad.right_d, prev.right_d) {
                         g.drop_item(false);
                     }
                 }
@@ -616,10 +628,18 @@ impl App {
 
         // Audio.
         if let Some(a) = &mut self.audio {
+            let underwater = self.game.as_ref().is_some_and(|g| g.in_world && g.eyes_in_water);
+            a.tick_ambient(underwater.then_some("ambient.underwater.loop"));
             if let Some(g) = &mut self.game {
                 a.set_listener(g.cam.eye, g.cam.yaw);
+                // Vanilla's sound engine has a limited channel pool; a chain of explosions mustn't start hundreds at once.
+                let mut started: HashMap<String, u32> = HashMap::new();
                 for (ev, at, vol, pitch, cat) in g.sounds.drain(..) {
-                    a.play(&ev, at, vol, pitch, cat);
+                    let n = started.entry(ev.clone()).or_insert(0);
+                    *n += 1;
+                    if *n <= 8 {
+                        a.play(&ev, at, vol, pitch, cat);
+                    }
                 }
             }
             let clicks = ui::CLICKS.with(|c| c.replace(0));
@@ -662,8 +682,17 @@ impl App {
                 let info = g.debug_info(self.fps, &self.options, (w, h), &gpu, &server);
                 debug::draw(&mut painter, &info);
             }
+            if self.options.fps_graph && !self.hide_hud {
+                // Under F3's right column when it's open, else in the top right corner.
+                let y = if self.show_debug { painter.height - 62.0 } else { 2.0 };
+                crate::hud::fps_graph(&mut painter, &self.frame_times, self.fps, y);
+            }
             if container_open {
                 g.container_screen(&mut painter, &input);
+                // The OS cursor stays hidden while the controller moves this one.
+                if self.pad_mode {
+                    crate::hud::pad_cursor(&mut painter, input.mouse);
+                }
             }
         }
 
@@ -706,12 +735,17 @@ impl App {
             }
         }
         self.frames += 1;
+        if self.frame_times.len() >= 120 {
+            self.frame_times.pop_front();
+        }
+        self.frame_times.push_back(dt * 1000.0);
         if self.fps_since.elapsed() >= Duration::from_secs(1) {
             self.fps = self.frames as f32 / self.fps_since.elapsed().as_secs_f32();
             self.frames = 0;
             if let Some(g) = self.game.as_ref().filter(|_| std::env::var_os("MCRS_DEBUG_STATS").is_some()) {
                 let (drawn, loaded, tris, _) = g.stats;
-                println!("fps {:.0}, sections {drawn}/{loaded}, {tris} triangles, cave culling {}", self.fps, self.options.cave_culling);
+                let i = g.debug_info(self.fps, &self.options, (w, h), "", "");
+                println!("fps {:.0}, sections {drawn}/{loaded}, {tris} triangles, cave culling {}, light {} sky {} block", self.fps, self.options.cave_culling, i.sky_light, i.block_light);
             }
             self.fps_since = Instant::now();
             if let Some(win) = &self.window {
@@ -801,6 +835,7 @@ impl App {
             match code {
                 KeyCode::KeyB => g.show_hitboxes = !g.show_hitboxes,
                 KeyCode::KeyG => g.show_chunk_borders = !g.show_chunk_borders,
+                KeyCode::KeyP => self.options.pause_on_lost_focus = !self.options.pause_on_lost_focus,
                 _ => {}
             }
             return;
@@ -933,8 +968,8 @@ impl ApplicationHandler for App {
                 self.mouse_left = false;
                 self.mouse_right = false;
                 self.set_grab(false);
-                // Vanilla opens the pause menu when the window loses focus.
-                if self.screens.is_empty() && self.game.as_ref().is_some_and(|g| g.ready() && !g.screen_open() && g.chat_input.is_none()) {
+                // Vanilla opens the pause menu when the window loses focus (unless F3+P turned that off).
+                if self.options.pause_on_lost_focus && self.screens.is_empty() && self.game.as_ref().is_some_and(|g| g.ready() && !g.screen_open() && g.chat_input.is_none()) {
                     self.screens.push(Screen::Pause);
                 }
             }
@@ -981,7 +1016,7 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
                 };
-                let in_game = self.screens.is_empty() && self.grabbed;
+                let in_game = self.screens.is_empty() && self.grabbed && self.game.as_ref().is_some_and(|g| !g.screen_open());
                 match &mut self.game {
                     // Scrolling down moves right along the hotbar, like vanilla.
                     Some(g) if in_game => {

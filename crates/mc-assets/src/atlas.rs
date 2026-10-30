@@ -15,6 +15,8 @@ pub struct Atlas {
     rects: HashMap<String, [f32; 4]>,
     alpha: HashMap<String, (bool, bool)>,
     pub animations: Vec<Animation>,
+    /// Textures that couldn't be read (drawn as the magenta and black checker).
+    pub missing: Vec<String>,
 }
 
 fn missing() -> Vec<u8> {
@@ -158,10 +160,16 @@ impl Atlas {
         let mut alpha = HashMap::new();
         let inset = 1.0 / 256.0;
         let mut animations = Vec::new();
+        let mut missing_names = Vec::new();
 
         let all = std::iter::once("minecraft:missingno".to_string()).chain(names.iter().cloned());
         for (i, name) in all.enumerate() {
-            let px = load_tile(jar, &name).unwrap_or_else(missing);
+            let px = load_tile(jar, &name).unwrap_or_else(|| {
+                if i > 0 && name != "minecraft:missingno" {
+                    missing_names.push(name.clone());
+                }
+                missing()
+            });
             let (cx, cy) = ((i % COLUMNS) * TILE, (i / COLUMNS) * TILE);
             if let Some((frames, sequence)) = load_animation(jar, &name) {
                 let length = sequence.iter().map(|s| s.1).sum();
@@ -183,7 +191,7 @@ impl Atlas {
             alpha.insert(name, (has_alpha, translucent));
         }
         let mips = mipmaps(&rgba, width, height);
-        Ok(Self { width: width as u32, height: height as u32, rgba, mips, rects, alpha, animations })
+        Ok(Self { width: width as u32, height: height as u32, rgba, mips, rects, alpha, animations, missing: missing_names })
     }
 
     pub fn rect(&self, name: &str) -> [f32; 4] {

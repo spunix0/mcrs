@@ -206,6 +206,8 @@ pub struct Game {
     pub air: i32,
     pub hardcore: bool,
     pub game_mode: u8,
+    /// Creative (or `/ability`) flight is allowed: double-tapping jump toggles it.
+    may_fly: bool,
     /// Game mode to go back to after noclip flying.
     walk_mode: u8,
     pub entity_id: i32,
@@ -265,6 +267,14 @@ pub struct Game {
     pub on_fire: bool,
     /// Ticks the eyes have been underwater (vanilla's water vision).
     water_time: f32,
+    /// Last tick's water state, for the splash on entering and the underwater ambience on going under.
+    touching_water: bool,
+    pub eyes_in_water: bool,
+    /// The air bubble that last popped (vanilla's `lastBubblePopSoundPlayed`).
+    last_bubble: i32,
+    /// The item being used (eaten, drunk, drawn) and since when.
+    using: Option<(u32, Instant)>,
+    rng: u64,
     /// The creative inventory while open, and its tabs (built on first open).
     pub creative: Option<crate::creative::Screen>,
     creative_tabs: Vec<crate::creative::Tab>,
@@ -308,6 +318,7 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 
 impl Game {
     pub fn new(models: Arc<BlockModels>, tx: mc_protocol::Sender, net: Receiver<Event>, ended: Arc<Mutex<Option<String>>>, noclip: bool) -> Self {
+        let sheets = [models.explosion_uv.clone(), models.smoke_uv.clone()];
         let (jobs, job_rx) = channel::<(u64, Area)>();
         let (mesh_tx, meshes) = channel();
         let job_rx = Arc::new(Mutex::new(job_rx));
@@ -317,7 +328,8 @@ impl Game {
             std::thread::spawn(move || {
                 loop {
                     let Ok((version, area)) = job_rx.lock().unwrap().recv() else { return };
-                    if mesh_tx.send((version, mc_render::mesh_chunk(&area, &models))).is_err() {
+                    let mesh = mc_render::mesh_chunk(&area, &models);
+                    if mesh_tx.send((version, mesh)).is_err() {
                         return;
                     }
                 }
@@ -358,6 +370,7 @@ impl Game {
             air: 300,
             hardcore: false,
             game_mode: 0,
+            may_fly: false,
             walk_mode: 0,
             entity_id: -1,
             death_screen: true,
@@ -366,7 +379,11 @@ impl Game {
             chat_input: None,
             sky: Sky::new(),
             rain: 0.0,
-            particles: Particles::default(),
+            particles: {
+                let mut p = Particles::default();
+                p.sheets = sheets;
+                p
+            },
             sounds: Vec::new(),
             swing: Swing::default(),
             main_height: 0.0,
@@ -409,6 +426,11 @@ impl Game {
             attack_queued: false,
             on_fire: false,
             water_time: 0.0,
+            touching_water: false,
+            eyes_in_water: false,
+            last_bubble: 0,
+            using: None,
+            rng: 0x2545_f491_4f6c_dd1d ^ Instant::now().elapsed().as_nanos() as u64 ^ std::process::id() as u64,
             creative: None,
             creative_tabs: Vec::new(),
             creative_tab: 0,
@@ -464,6 +486,14 @@ impl Game {
 
     fn sound(&mut self, event: &str, at: Option<[f64; 3]>, volume: f32, pitch: f32, cat: usize) {
         self.sounds.push((event.to_string(), at, volume, pitch, cat));
+    }
+
+    /// 0..1, for sound pitch and chances (xorshift64*).
+    fn rand(&mut self) -> f32 {
+        self.rng ^= self.rng >> 12;
+        self.rng ^= self.rng << 25;
+        self.rng ^= self.rng >> 27;
+        (self.rng.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 40) as f32 / (1u64 << 24) as f32
     }
 
     fn chat(&mut self, line: String) {
@@ -541,7 +571,9 @@ impl Game {
                 Event::Teleport(feet, rot, id) => {
                     let _ = session::send_accept_teleport(&self.tx, id, feet, rot);
                     self.cam.eye = [feet[0], feet[1] + EYE_HEIGHT, feet[2]];
+                    let flying = self.body.flying;
                     self.body = Body::new(feet);
+                    self.body.flying = flying;
                     self.prev_feet = feet;
                     self.cam.yaw = rot[0];
                     self.cam.pitch = rot[1];
@@ -564,13 +596,33 @@ impl Game {
                         self.sound(&name, at, volume, pitch, category);
                     }
                 }
+                Event::Explode { center, radius, knockback, sound } => {
+                    // ClientPacketListener.handleExplosion: the sound at volume 4, the particles, and our push.
+                    let name = match sound {
+                        Some(SoundRef::Id(id)) => self.models.sound_events.get(id as usize).cloned(),
+                        Some(SoundRef::Name(n)) => Some(n),
+                        None => None,
+                    };
+                    let pitch = (1.0 + (self.rand() - self.rand()) * 0.2) * 0.7;
+                    self.sound(name.as_deref().unwrap_or("entity.generic.explode"), Some(center), 4.0, pitch, category::BLOCKS);
+                    self.particles.explosion(Vec3::new(center[0] as f32, center[1] as f32, center[2] as f32), radius);
+                    if let Some(k) = knockback {
+                        for i in 0..3 {
+                            self.body.vel[i] += k[i];
+                        }
+                    }
+                }
                 // 2001: someone else broke a block (data = its state).
                 Event::LevelEvent { kind: 2001, pos, data } => {
                     self.block_sound(pos, Some(data as u16), |s| &s.break_, |v| (v + 1.0) / 2.0, 0.8);
                     self.break_particles(pos, data as u16);
                 }
                 Event::LevelEvent { .. } => {}
-                Event::EntityAdd { id, kind, pos, yaw, pitch, head_yaw, data } => self.entities.add(id, kind, pos, yaw, pitch, head_yaw, data),
+                Event::EntityAdd { id, kind, pos, vel, yaw, pitch, head_yaw, data } => {
+                    let simulate = self.models.entities.get(kind as usize).is_some_and(|i| matches!(i.name.as_str(), "item" | "experience_orb"));
+                    self.entities.add(id, kind, pos, vel, yaw, pitch, head_yaw, data, simulate);
+                }
+                Event::EntityMotion(id, vel) => self.entities.motion(id, vel),
                 Event::EntityMove { id, steps, rot } => self.entities.moved(id, &steps, rot),
                 Event::EntityRot { id, rot } => self.entities.rotated(id, rot),
                 Event::EntityPos { id, pos, rot } => self.entities.teleported(id, pos, rot),
@@ -578,6 +630,18 @@ impl Game {
                 Event::EntityRemove(ids) => {
                     for id in ids {
                         self.entities.map.remove(&id);
+                    }
+                }
+                Event::TakeItem(id) => {
+                    // ClientPacketListener.handleTakeItemEntity.
+                    let Some(e) = self.entities.map.get(&id) else { continue };
+                    let at = Some(e.render_pos(Instant::now()));
+                    let kind = self.models.entities.get(e.kind as usize).map(|i| i.name.clone());
+                    let (a, b) = (self.rand(), self.rand());
+                    match kind.as_deref() {
+                        Some("experience_orb") => self.sound("entity.experience_orb.pickup", at, 0.1, (a - b) * 0.35 + 0.9, category::PLAYERS),
+                        Some(_) => self.sound("entity.item.pickup", at, 0.2, ((a - b) * 0.7 + 1.0) * 2.0, category::PLAYERS),
+                        None => {}
                     }
                 }
                 Event::EntityData { id, data, air } => {
@@ -673,10 +737,30 @@ impl Game {
                     self.cursor = None;
                 }
                 Event::Cursor(c) => self.cursor = c,
-                Event::Hurt(id) => {
+                Event::Hurt(id, kind) => {
                     self.entities.hurt(id);
+                    // LivingEntity.handleDamageEvent plays the hurt sound on every client, ours included.
+                    let pitch = (self.rand() - self.rand()) * 0.2 + 1.0;
                     if id == self.entity_id {
                         self.hurt_time = 10.0;
+                        // Player.getHurtSound: from the damage type's effects (DamageTypes).
+                        let sound = match kind.as_deref().map(|k| k.trim_start_matches("minecraft:")) {
+                            Some("drown") => "entity.player.hurt_drown",
+                            Some("in_fire" | "campfire" | "on_fire" | "lava" | "hot_floor" | "sulfur_cube_hot" | "unattributed_fireball") => "entity.player.hurt_on_fire",
+                            Some("sweet_berry_bush") => "entity.player.hurt_sweet_berry_bush",
+                            Some("freeze") => "entity.player.hurt_freeze",
+                            _ => "entity.player.hurt",
+                        };
+                        self.sound(sound, Some(self.feet()), 1.0, pitch, category::PLAYERS);
+                    } else if let Some(e) = self.entities.map.get(&id) {
+                        let at = Some(e.render_pos(Instant::now()));
+                        let baby = if e.baby { 0.5 } else { 0.0 };
+                        if let Some(info) = self.models.entities.get(e.kind as usize) {
+                            let event = format!("entity.{}.hurt", info.name);
+                            let event = if self.models.sound_events.contains(&event) { event } else { "entity.generic.hurt".into() };
+                            let cat = if info.category == "monster" { category::HOSTILE } else { category::NEUTRAL };
+                            self.sound(&event, at, 1.0, pitch + baby, cat);
+                        }
                     }
                 }
                 Event::Swing(id) => self.entities.swing(id),
@@ -712,6 +796,10 @@ impl Game {
                 Event::TabList(h, f) => self.tab = (self.text(&h), self.text(&f)),
                 Event::Enchantments(names) => self.enchantments = names,
                 Event::Difficulty(d) => self.difficulty = d,
+                Event::Abilities(flags) => {
+                    self.may_fly = flags & 4 != 0;
+                    self.body.flying = flags & 2 != 0;
+                }
             }
         }
         self.dispatch();

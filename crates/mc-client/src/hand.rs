@@ -18,6 +18,39 @@ pub struct Pose {
     pub sway: [f32; 2],
     /// 0..1 brightness at the player.
     pub light: f32,
+    /// The item being used: its animation, ticks since it started (with the partial tick) and how long it lasts.
+    pub using: Option<(UseAnim, f32, f32)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum UseAnim {
+    /// Eating and drinking share vanilla's `applyEatTransform`.
+    Eat,
+    Bow,
+}
+
+const FOODS: &[&str] = &[
+    "apple", "baked_potato", "beef", "beetroot", "beetroot_soup", "bread", "carrot", "chicken", "chorus_fruit", "cod", "cooked_beef",
+    "cooked_chicken", "cooked_cod", "cooked_mutton", "cooked_porkchop", "cooked_rabbit", "cooked_salmon", "cookie", "dried_kelp",
+    "enchanted_golden_apple", "golden_apple", "golden_carrot", "melon_slice", "mushroom_stew", "mutton", "poisonous_potato", "porkchop",
+    "potato", "pufferfish", "pumpkin_pie", "rabbit", "rabbit_stew", "rotten_flesh", "salmon", "spider_eye", "suspicious_stew",
+    "sweet_berries", "glow_berries", "tropical_fish",
+];
+
+pub fn is_food(name: &str) -> bool {
+    FOODS.contains(&name)
+}
+
+/// How an item animates while used and for how many ticks (vanilla's `Consumable` defaults; a bow pulls forever).
+pub fn use_animation(name: &str) -> Option<(UseAnim, f32)> {
+    Some(match name {
+        "bow" => (UseAnim::Bow, 72000.0),
+        "dried_kelp" => (UseAnim::Eat, 16.0),
+        "honey_bottle" => (UseAnim::Eat, 40.0),
+        "potion" | "milk_bucket" | "ominous_bottle" => (UseAnim::Eat, 32.0),
+        n if is_food(n) => (UseAnim::Eat, 32.0),
+        _ => return None,
+    })
 }
 
 fn deg(a: f32) -> f32 {
@@ -58,12 +91,47 @@ pub fn display(t: &Transform) -> Mat4 {
     Mat4::from_translation(Vec3::from(t.translation)) * Mat4::from_quat(Quat::from_euler(glam::EulerRot::XYZ, rx, ry, rz)) * Mat4::from_scale(Vec3::from(t.scale))
 }
 
-/// The held item, as `submitArmWithItem` for a plain item (no use animation).
+/// The held item, as `submitArmWithItem`: the use animation (eating, drawing a bow) or else the swing.
 pub fn item(out: &mut Vec<Vertex>, p: &Pose, item: &ItemInfo) {
     let a = p.attack;
     let pi = std::f32::consts::PI;
-    let mut m = base(p) * Mat4::from_translation(Vec3::new(0.56, -0.52 + p.inverse_height * -0.6, -0.72));
-    if a > 0.0 {
+    let arm = Mat4::from_translation(Vec3::new(0.56, -0.52 + p.inverse_height * -0.6, -0.72));
+    let mut m = base(p);
+    match p.using {
+        Some((UseAnim::Eat, elapsed, duration)) => {
+            // applyEatTransform, then applyItemArmTransform.
+            let current = duration - elapsed + 1.0;
+            let scaled = current / duration;
+            if scaled < 0.8 {
+                m *= Mat4::from_translation(Vec3::new(0.0, ((current / 4.0 * pi).cos() * 0.1).abs(), 0.0));
+            }
+            let j = 1.0 - scaled.powi(27);
+            m = m
+                * Mat4::from_translation(Vec3::new(j * 0.6, j * -0.5, 0.0))
+                * Mat4::from_rotation_y(deg(j * 90.0))
+                * Mat4::from_rotation_x(deg(j * 10.0))
+                * Mat4::from_rotation_z(deg(j * 30.0))
+                * arm;
+        }
+        Some((UseAnim::Bow, elapsed, _)) => {
+            m = m
+                * arm
+                * Mat4::from_translation(Vec3::new(-0.2785682, 0.18344387, 0.15731531))
+                * Mat4::from_rotation_x(deg(-13.935))
+                * Mat4::from_rotation_y(deg(35.3))
+                * Mat4::from_rotation_z(deg(-9.785));
+            let held = elapsed - 1.0;
+            let power = (held / 20.0 * (held / 20.0) + held / 20.0 * 2.0) / 3.0;
+            let power = power.clamp(0.0, 1.0);
+            if power > 0.1 {
+                let shake = ((held - 0.1) * 1.3).sin() * (power - 0.1);
+                m *= Mat4::from_translation(Vec3::new(0.0, shake * 0.004, 0.0));
+            }
+            m = m * Mat4::from_translation(Vec3::new(0.0, 0.0, power * 0.04)) * Mat4::from_scale(Vec3::new(1.0, 1.0, 1.0 + power * 0.2)) * Mat4::from_rotation_y(deg(-45.0));
+        }
+        None => m *= arm,
+    }
+    if a > 0.0 && p.using.is_none() {
         // swingArm + applyItemArmAttackTransform.
         let sq = a.sqrt();
         m = m
@@ -96,13 +164,19 @@ fn emit(out: &mut Vec<Vertex>, q: &Quad, m: Mat4, light: f32, tint: [u8; 3]) {
 }
 
 /// A block state's model drawn like a block (falling sand, primed TNT), feet-centered at `pos`.
-pub fn block(out: &mut Vec<Vertex>, quads: &[Quad], pos: Vec3, light: f32, tint: [u8; 3]) {
-    let m = Mat4::from_translation(pos - Vec3::new(0.5, 0.0, 0.5));
+/// `scale` grows it around its bottom center; `flash` draws every face with that texture rect instead (primed TNT's
+/// white flash).
+pub fn block(out: &mut Vec<Vertex>, quads: &[Quad], pos: Vec3, light: f32, tint: [u8; 3], scale: f32, flash: Option<[f32; 4]>) {
+    let m = Mat4::from_translation(pos) * Mat4::from_scale(Vec3::splat(scale)) * Mat4::from_translation(Vec3::new(-0.5, 0.0, -0.5));
     for q in quads {
-        let c = (255.0 * light * q.shade) as u8;
-        let t = if q.tinted { tint } else { [255; 3] };
+        let c = (255.0 * if flash.is_some() { 1.0 } else { light * q.shade }) as u8;
+        let t = if q.tinted && flash.is_none() { tint } else { [255; 3] };
         let color = [(t[0] as u32 * c as u32 / 255) as u8, (t[1] as u32 * c as u32 / 255) as u8, (t[2] as u32 * c as u32 / 255) as u8, 255];
-        let v = |i: usize| Vertex { pos: m.transform_point3(Vec3::from(q.pos[i])).into(), uv: q.uv[i], color };
+        let uv = |i: usize| match flash {
+            Some([u0, v0, u1, v1]) => [[u0, v0], [u0, v1], [u1, v1], [u1, v0]][i],
+            None => q.uv[i],
+        };
+        let v = |i: usize| Vertex { pos: m.transform_point3(Vec3::from(q.pos[i])).into(), uv: uv(i), color };
         out.extend_from_slice(&[v(0), v(1), v(2), v(0), v(2), v(3)]);
     }
 }
@@ -140,7 +214,7 @@ mod tests {
     use super::*;
 
     fn pose() -> Pose {
-        Pose { cam_to_world: Mat4::IDENTITY, attack: 0.0, inverse_height: 0.0, sway: [0.0; 2], light: 1.0 }
+        Pose { cam_to_world: Mat4::IDENTITY, attack: 0.0, inverse_height: 0.0, sway: [0.0; 2], light: 1.0, using: None }
     }
 
     /// In camera space (x right, y up, -z forward) the hand must sit low, to the right and in front.

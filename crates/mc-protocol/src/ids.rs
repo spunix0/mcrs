@@ -63,6 +63,7 @@ pub mod play {
         pub const CONFIGURATION_ACKNOWLEDGED: i32 = 16;
         pub const KEEP_ALIVE: i32 = 28;
         pub const MOVE_PLAYER_POS_ROT: i32 = 31;
+        pub const PLAYER_ABILITIES: i32 = 40;
         pub const PLAYER_ACTION: i32 = 41;
         pub const PLAYER_LOADED: i32 = 44;
         pub const PONG: i32 = 45;
@@ -79,6 +80,7 @@ pub mod play {
     pub mod s2c {
         pub const ADD_ENTITY: i32 = 1;
         pub const ENTITY_POSITION_SYNC: i32 = 35;
+        pub const EXPLODE: i32 = 36;
         pub const MOVE_ENTITY_POS: i32 = 54;
         pub const MOVE_ENTITY_POS_ROT: i32 = 55;
         pub const MOVE_ENTITY_ROT: i32 = 57;

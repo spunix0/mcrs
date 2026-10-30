@@ -13,6 +13,10 @@ pub mod category {
     pub const MASTER: usize = 0;
     pub const MUSIC: usize = 1;
     pub const BLOCKS: usize = 4;
+    pub const HOSTILE: usize = 5;
+    pub const NEUTRAL: usize = 6;
+    pub const PLAYERS: usize = 7;
+    pub const AMBIENT: usize = 8;
     pub const UI: usize = 10;
     pub const COUNT: usize = 11;
     pub const NAMES: [&str; COUNT] = ["master", "music", "record", "weather", "block", "hostile", "neutral", "player", "ambient", "voice", "ui"];
@@ -43,6 +47,8 @@ pub struct Audio {
     music_kind: &'static str,
     music_gain: f32,
     next_music: Instant,
+    /// A looping ambience (underwater) and its event.
+    ambient: Option<(&'static str, rodio::Player)>,
     /// Volume per category, 0..1 (from the options).
     pub volumes: [f32; category::COUNT],
 }
@@ -98,6 +104,7 @@ impl Audio {
             music_kind: "",
             music_gain: 1.0,
             next_music: Instant::now(),
+            ambient: None,
             volumes: [1.0; category::COUNT],
         })
     }
@@ -189,6 +196,23 @@ impl Audio {
         }
         let Some(decoded) = self.decoded(&file) else { return };
         self.sink.mixer().add(effect(&decoded, pitch, gain, pan));
+    }
+
+    /// Keeps a looping ambience (`ambient.underwater.loop`) playing, or stops it with `None`.
+    pub fn tick_ambient(&mut self, event: Option<&'static str>) {
+        if self.ambient.as_ref().map(|a| a.0) != event {
+            self.ambient = None;
+        }
+        let Some(event) = event else { return };
+        if self.ambient.as_ref().is_some_and(|a| !a.1.empty()) {
+            return;
+        }
+        let mix = self.volumes[category::MASTER] * self.volumes[category::AMBIENT];
+        let Some((file, vol, pitch)) = self.pick(event, 0) else { return };
+        let Some(d) = self.decoded(&file) else { return };
+        let player = self.ambient.take().map_or_else(|| rodio::Player::connect_new(self.sink.mixer()), |a| a.1);
+        player.append(effect(&d, pitch, vol * mix, 0.0));
+        self.ambient = Some((event, player));
     }
 
     /// Keeps the music volume in line with the options.

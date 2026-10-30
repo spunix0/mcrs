@@ -45,7 +45,8 @@ pub enum Event {
     Time { day: Option<(i64, f32)> },
     EntityData { id: i32, data: Vec<crate::entities::Data>, air: Option<i32> },
     /// An entity was hurt (red flash; camera shake if it's us).
-    Hurt(i32),
+    /// An entity took damage, with the damage type's name (`minecraft:drown`, ...).
+    Hurt(i32, Option<String>),
     /// An entity swung its arm.
     Swing(i32),
     /// We died, with the death message.
@@ -64,6 +65,8 @@ pub enum Event {
     /// Enchantment registry names in ID order (to find Efficiency).
     Enchantments(Vec<String>),
     Difficulty(u8),
+    /// Ability flags: 2 flying, 4 may fly.
+    Abilities(u8),
     /// Rain strength 0..1.
     Rain(f32),
     /// One slot in the inventory's own order (`set_player_inventory`).
@@ -73,7 +76,7 @@ pub enum Event {
     Sound { event: SoundRef, at: Option<[f64; 3]>, entity: Option<i32>, volume: f32, pitch: f32, category: usize },
     /// World events such as 2001 (block broken by someone else, `data` = block state).
     LevelEvent { kind: i32, pos: [i32; 3], data: i32 },
-    EntityAdd { id: i32, kind: u32, pos: [f64; 3], yaw: f32, pitch: f32, head_yaw: f32, data: i32 },
+    EntityAdd { id: i32, kind: u32, pos: [f64; 3], vel: [f64; 3], yaw: f32, pitch: f32, head_yaw: f32, data: i32 },
     /// Relative moves in 1/4096 blocks; several steps since 26.x.
     EntityMove { id: i32, steps: Vec<[i16; 3]>, rot: Option<[f32; 2]> },
     EntityRot { id: i32, rot: [f32; 2] },
@@ -81,6 +84,11 @@ pub enum Event {
     EntityPos { id: i32, pos: [f64; 3], rot: [f32; 2] },
     EntityHead { id: i32, yaw: f32 },
     EntityRemove(Vec<i32>),
+    /// An item or XP orb was picked up (vanilla plays the pickup sound from this).
+    TakeItem(i32),
+    EntityMotion(i32, [f64; 3]),
+    /// An explosion: center, radius, the push it gives us, and its sound (None = the default).
+    Explode { center: [f64; 3], radius: f32, knockback: Option<[f64; 3]>, sound: Option<SoundRef> },
     /// Server moved us: feet position and yaw/pitch.
     Teleport([f64; 3], [f32; 2], i32),
     Chat(String),
@@ -160,18 +168,21 @@ fn angle(b: u8) -> f32 {
     b as i8 as f32 * 360.0 / 256.0
 }
 
-/// `LpVec3`: a compact velocity. Only skipped here; entities don't predict motion yet.
-fn skip_lp_vec3(r: &mut Reader) -> Result<()> {
-    let lowest = r.u8()?;
+/// `LpVec3`: a velocity as three 15-bit fractions of a shared scale (net.minecraft.network.LpVec3).
+fn lp_vec3(r: &mut Reader) -> Result<[f64; 3]> {
+    let lowest = r.u8()? as u64;
     if lowest == 0 {
-        return Ok(());
+        return Ok([0.0; 3]);
     }
-    r.u8()?;
-    r.i32()?;
+    let middle = r.u8()? as u64;
+    let highest = r.i32()? as u32 as u64;
+    let buffer = highest << 16 | middle << 8 | lowest;
+    let mut scale = lowest & 3;
     if lowest & 4 != 0 {
-        r.varint()?;
+        scale |= (r.varint()? as u32 as u64) << 2;
     }
-    Ok(())
+    let unpack = |v: u64| ((v & 32767) as f64).min(32766.0) * 2.0 / 32766.0 - 1.0;
+    Ok([unpack(buffer >> 3) * scale as f64, unpack(buffer >> 18) * scale as f64, unpack(buffer >> 33) * scale as f64])
 }
 
 /// `VecDelta`: one (dx, dy, dz) in shorts, or `steps` of (ticks, dx, dy, dz).
@@ -216,6 +227,7 @@ fn entity_data(r: &mut Reader, comps: Option<&Components>) -> Result<(Vec<crate:
                 let v = r.varint()?;
                 match index {
                     1 => air = Some(v),
+                    8 => out.push(Data::Fuse(v)),
                     16 => out.push(Data::Size(v)),
                     _ => {}
                 }
@@ -416,10 +428,22 @@ pub fn send_sprint(tx: &Sender, entity: i32, start: bool) -> Result<()> {
     Ok(())
 }
 
+/// Tells the server creative flight started or stopped (`player_abilities`, bit 2 = flying).
+pub fn send_flying(tx: &Sender, flying: bool) -> Result<()> {
+    tx.send(play::c2s::PLAYER_ABILITIES, &[if flying { 2 } else { 0 }])?;
+    Ok(())
+}
+
 /// Drops the held item: `player_action` 5 (one) or 4 (whole stack); 26.x put CHANGE_DESTROY_DIRECTION at 1.
 pub fn send_drop(tx: &Sender, whole_stack: bool) -> Result<()> {
     let action = if whole_stack { 4 } else { 5 };
     tx.send(play::c2s::PLAYER_ACTION, &Writer::new().varint(action).i64(0).u8(0).varint(0).buf)?;
+    Ok(())
+}
+
+/// Letting go of right click while using an item (`player_action` 6): shoots a bow, stops eating.
+pub fn send_release_use(tx: &Sender) -> Result<()> {
+    tx.send(play::c2s::PLAYER_ACTION, &Writer::new().varint(6).i64(0).u8(0).varint(0).buf)?;
     Ok(())
 }
 
@@ -578,6 +602,7 @@ pub fn run(opts: &Options, tx: Sender, mut rx: mc_protocol::Receiver, mut emit: 
     let mut loaded = false;
     let mut min_section = MIN_SECTION;
     let mut overworld_clock: Option<i32> = None;
+    let mut damage_types: Vec<String> = Vec::new();
     let debug = std::env::var_os("MCRS_DEBUG").is_some();
     loop {
         let (id, body) = rx.recv()?;
@@ -640,6 +665,16 @@ pub fn run(opts: &Options, tx: Sender, mut rx: mc_protocol::Receiver, mut emit: 
                         }
                     }
                     emit(Event::Enchantments(names));
+                }
+                if registry == "minecraft:damage_type" {
+                    // Damage events name their type by this ID; the player's hurt sound depends on it.
+                    damage_types.clear();
+                    for _ in 0..entries {
+                        damage_types.push(r.string()?);
+                        if r.bool()? {
+                            r.nbt()?;
+                        }
+                    }
                 }
             }
             (State::Config, config::s2c::KEEP_ALIVE) => tx.send(config::c2s::KEEP_ALIVE, &Writer::new().i64(r.i64()?).buf)?,
@@ -747,10 +782,10 @@ pub fn run(opts: &Options, tx: Sender, mut rx: mc_protocol::Receiver, mut emit: 
                 let _uuid = r.uuid()?;
                 let kind = r.varint()? as u32;
                 let pos = vec3(&mut r)?;
-                skip_lp_vec3(&mut r)?;
+                let vel = lp_vec3(&mut r)?;
                 let (pitch, yaw, head_yaw) = (angle(r.u8()?), angle(r.u8()?), angle(r.u8()?));
                 let data = r.varint().unwrap_or(0);
-                emit(Event::EntityAdd { id, kind, pos, yaw, pitch, head_yaw, data });
+                emit(Event::EntityAdd { id, kind, pos, vel, yaw, pitch, head_yaw, data });
             }
             (State::Play, packet @ (play::s2c::MOVE_ENTITY_POS | play::s2c::MOVE_ENTITY_POS_ROT)) => {
                 let entity = r.varint()?;
@@ -797,6 +832,21 @@ pub fn run(opts: &Options, tx: Sender, mut rx: mc_protocol::Receiver, mut emit: 
                 let n = r.len()?;
                 let ids = (0..n).map(|_| r.varint()).collect::<std::io::Result<Vec<_>>>()?;
                 emit(Event::EntityRemove(ids));
+            }
+            (State::Play, play::s2c::TAKE_ITEM_ENTITY) => emit(Event::TakeItem(r.varint()?)),
+            (State::Play, play::s2c::EXPLODE) => {
+                let center = vec3(&mut r)?;
+                let radius = r.f32()?;
+                let _blocks = r.i32()?;
+                let knockback = if r.bool()? { Some(vec3(&mut r)?) } else { None };
+                // The particle (explosion or explosion_emitter carry no data), then the sound holder.
+                let _particle = r.varint()?;
+                let sound = sound_ref(&mut r).ok();
+                emit(Event::Explode { center, radius, knockback, sound });
+            }
+            (State::Play, play::s2c::SET_ENTITY_MOTION) => {
+                let id = r.varint()?;
+                emit(Event::EntityMotion(id, lp_vec3(&mut r)?));
             }
             (State::Play, play::s2c::SOUND) => {
                 let event = sound_ref(&mut r)?;
@@ -894,7 +944,11 @@ pub fn run(opts: &Options, tx: Sender, mut rx: mc_protocol::Receiver, mut emit: 
             (State::Play, play::s2c::CONTAINER_SET_DATA) => {
                 emit(Event::ContainerData { id: r.varint()?, prop: r.i16()?, value: r.i16()? });
             }
-            (State::Play, play::s2c::DAMAGE_EVENT) => emit(Event::Hurt(r.varint()?)),
+            (State::Play, play::s2c::DAMAGE_EVENT) => {
+                let id = r.varint()?;
+                let kind = r.varint().ok().and_then(|t| damage_types.get(t as usize).cloned());
+                emit(Event::Hurt(id, kind));
+            }
             (State::Play, play::s2c::ANIMATE) => {
                 let id = r.varint()?;
                 // 0 = swing main hand, 3 = swing off hand.
@@ -925,6 +979,7 @@ pub fn run(opts: &Options, tx: Sender, mut rx: mc_protocol::Receiver, mut emit: 
                 emit(Event::TabList(header, footer));
             }
             (State::Play, play::s2c::CHANGE_DIFFICULTY) => emit(Event::Difficulty(r.u8()?)),
+            (State::Play, play::s2c::PLAYER_ABILITIES) => emit(Event::Abilities(r.u8()?)),
             (State::Play, play::s2c::SET_HEALTH) => {
                 let health = r.f32()?;
                 emit(Event::Health { health, food: r.varint()? });
@@ -991,5 +1046,16 @@ mod tests {
     fn offline_uuid_matches_java() {
         // UUID.nameUUIDFromBytes("OfflinePlayer:Notch")
         assert_eq!(format!("{:032x}", offline_uuid("Notch")), "b50ad385829d3141a2167e7d7539ba7f");
+    }
+
+    #[test]
+    fn decodes_lp_vec3() {
+        // LpVec3.write of (0.5, -0.25, 0): scale 1, x/y/z packed as round((v * 0.5 + 0.5) * 32766).
+        let buffer: u64 = 1 | 24575 << 3 | 12287 << 18 | 16383 << 33;
+        let mut bytes = vec![buffer as u8, (buffer >> 8) as u8];
+        bytes.extend_from_slice(&((buffer >> 16) as u32).to_be_bytes());
+        let v = lp_vec3(&mut Reader::new(&bytes)).unwrap();
+        assert!((v[0] - 0.5).abs() < 1e-4 && (v[1] + 0.25).abs() < 1e-4 && v[2].abs() < 1e-4, "{v:?}");
+        assert_eq!(lp_vec3(&mut Reader::new(&[0])).unwrap(), [0.0; 3]);
     }
 }

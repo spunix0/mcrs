@@ -1,5 +1,7 @@
 ﻿//! Client-side world state: chunk sections, block-state palettes, light data and block queries used by the renderer and physics.
 
+pub mod relight;
+
 use std::io::{Error, ErrorKind, Result};
 
 pub const SECTION_VOLUME: usize = 4096;
@@ -142,6 +144,23 @@ impl Chunk {
             _ => 0,
         };
         (sky, block)
+    }
+
+    /// Sets one light level; returns false if `y` is outside the light sections. A section without data gets one
+    /// (full sky or no block light) first.
+    pub fn set_light(&mut self, x: usize, y: i32, z: usize, sky: bool, v: u8) -> bool {
+        let s = (y >> 4) - self.min_section + 1;
+        let count = self.light_sections();
+        let layer = if sky { &mut self.light.sky } else { &mut self.light.block };
+        if s < 0 || s as usize >= count {
+            return false;
+        }
+        layer.resize_with(count, || None);
+        let data = layer[s as usize].get_or_insert_with(|| Box::new([if sky { 0xff } else { 0 }; 2048]));
+        let i = (((y & 15) as usize) << 8) | (z << 4) | x;
+        let shift = (i & 1) * 4;
+        data[i >> 1] = (data[i >> 1] & !(15 << shift)) | (v & 15) << shift;
+        true
     }
 
     pub fn light_sections(&self) -> usize {

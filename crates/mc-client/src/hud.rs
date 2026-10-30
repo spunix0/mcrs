@@ -408,6 +408,35 @@ pub fn crosshair(p: &mut Painter, attack_strength: f32, show_indicator: bool) {
     }
 }
 
+/// Frame times as bars (one per frame, newest on the right) in the top right, with the FPS above them. Bars are green
+/// under 16.7 ms (60 fps), yellow under 33 ms, red above; the line marks 60 fps.
+pub fn fps_graph(p: &mut Painter, frame_times: &std::collections::VecDeque<f32>, fps: f32, y: f32) {
+    let (w, h) = (120.0, 40.0);
+    let x = p.width - w - 2.0;
+    let worst = frame_times.iter().copied().fold(0.0f32, f32::max);
+    p.text(&format!("{fps:.0} FPS  (worst {worst:.1} ms)"), x, y, WHITE);
+    let top = y + 10.0;
+    p.fill(x, top, w, h, [0, 0, 0, 144]);
+    // 2 GUI pixels per millisecond, so 60 fps sits a third of the way up.
+    for (i, ms) in frame_times.iter().enumerate() {
+        let bar = (ms * 2.0).clamp(1.0, h);
+        let color = if *ms < 16.7 { [80, 220, 80, 255] } else if *ms < 33.4 { [230, 210, 60, 255] } else { [230, 70, 60, 255] };
+        p.fill(x + w - frame_times.len() as f32 + i as f32, top + h - bar, 1.0, bar, color);
+    }
+    p.fill(x, top + h - 16.7 * 2.0, w, 0.5, [255, 255, 255, 96]);
+}
+
+/// The controller's pointer in inventories: a white arrow with a black outline, its tip at `(x, y)`.
+pub fn pad_cursor(p: &mut Painter, (x, y): (f32, f32)) {
+    let (x, y) = (x.floor(), y.floor());
+    for i in 0..10 {
+        p.fill(x, y + i as f32, i as f32 + 1.0, 1.0, [0, 0, 0, 255]);
+    }
+    for i in 2..9 {
+        p.fill(x + 1.0, y + i as f32, i as f32 - 1.0, 1.0, WHITE);
+    }
+}
+
 /// Recent chat (bottom-left, fading out after 10 seconds) and the input line while typing.
 pub fn chat(p: &mut Painter, log: &[(String, std::time::Instant)], input: Option<&str>, opacity: f32, background: f32) {
     let typing = input.is_some();

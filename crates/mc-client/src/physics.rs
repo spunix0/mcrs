@@ -60,6 +60,8 @@ pub struct Body {
     jump_delay: u8,
     /// Sprint-swimming: the 0.6-tall swim pose, steered by where you look.
     pub swimming: bool,
+    /// Creative flight; landing ends it.
+    pub flying: bool,
 }
 
 /// Vanilla scales diagonal stick/key input so the square of possible inputs maps onto the unit circle.
@@ -121,7 +123,7 @@ fn gather(world: &impl World, region: &Aabb, out: &mut Vec<Aabb>) {
 
 impl Body {
     pub fn new(pos: [f64; 3]) -> Self {
-        Self { pos, vel: [0.0; 3], on_ground: false, horizontal_collision: false, jump_delay: 0, swimming: false }
+        Self { pos, vel: [0.0; 3], on_ground: false, horizontal_collision: false, jump_delay: 0, swimming: false, flying: false }
     }
 
     pub fn aabb(&self) -> Aabb {
@@ -133,7 +135,7 @@ impl Body {
         self.in_water(world) || self.in_lava(world)
     }
 
-    fn in_water(&self, world: &impl World) -> bool {
+    pub fn in_water(&self, world: &impl World) -> bool {
         let [x, y, z] = self.pos;
         let (bx, bz) = (x.floor() as i32, z.floor() as i32);
         world.water(bx, y.floor() as i32, bz) || world.water(bx, (y + 0.9).floor() as i32, bz)
@@ -252,6 +254,20 @@ impl Body {
             if v.abs() < 0.003 {
                 *v = 0.0;
             }
+        }
+        if self.flying {
+            // LocalPlayer.aiStep and Player.travel while flying: jump and sneak climb and sink 0.15 a tick, no
+            // gravity, and the vertical speed keeps 60% each tick.
+            self.vel[1] += (input.jump as i32 - input.sneak as i32) as f64 * 0.15;
+            let ya = self.vel[1];
+            let v = square_input([input.strafe * 0.98, input.forward * 0.98]);
+            self.move_relative(if input.sprint { 0.1 } else { 0.05 }, [v[0] as f64, 0.0, v[1] as f64], yaw);
+            self.do_move(self.vel, world, &mut shapes);
+            self.vel = [self.vel[0] * 0.91, ya * 0.6, self.vel[2] * 0.91];
+            if self.on_ground {
+                self.flying = false;
+            }
+            return;
         }
         let in_water = self.in_water(world);
         let in_lava = !in_water && self.in_lava(world);
@@ -372,6 +388,27 @@ mod tests {
         fn water(&self, _: i32, _: i32, _: i32) -> bool {
             false
         }
+    }
+
+    #[test]
+    fn creative_flight_hovers_climbs_and_lands() {
+        let mut b = Body::new([0.5, 70.0, -10.5]);
+        b.flying = true;
+        for _ in 0..20 {
+            b.tick(&Input::default(), 0.0, &Flat);
+        }
+        assert_eq!(b.pos[1], 70.0, "no gravity while flying");
+        let up = Input { jump: true, ..Default::default() };
+        for _ in 0..10 {
+            b.tick(&up, 0.0, &Flat);
+        }
+        // Climbing settles at 0.15 / (1 - 0.6) = 0.375 a tick; the stored speed is 60% of that.
+        assert!(b.pos[1] > 72.5 && b.vel[1] > 0.2, "{:?}", b.pos);
+        let down = Input { sneak: true, ..Default::default() };
+        for _ in 0..40 {
+            b.tick(&down, 0.0, &Flat);
+        }
+        assert!(!b.flying && b.on_ground && b.pos[1] == 64.0, "landing ends flight");
     }
 
     fn settle() -> Body {

@@ -1,5 +1,5 @@
-//! Block particles like vanilla's `TerrainParticle`: the 4x4x4 burst when a block breaks and the small chips while
-//! mining. Simulated at 20 Hz and drawn as camera-facing quads from the block atlas.
+//! Block particles like vanilla's `TerrainParticle` (the 4x4x4 burst when a block breaks and the small chips while
+//! mining) and explosion puffs and smoke. Simulated at 20 Hz and drawn as camera-facing quads from the block atlas.
 
 use glam::Vec3;
 use mc_render::Vertex;
@@ -15,12 +15,22 @@ struct Particle {
     uv: [f32; 4],
     tint: [u8; 3],
     on_ground: bool,
+    /// Animated from a sheet over its life instead of a fixed `uv` (0 = none, 1 = explosion, 2 = smoke).
+    sheet: u8,
+    /// Gravity per tick (block pieces 0.04, explosion puffs none, smoke rises).
+    gravity: f32,
+    /// Ignores the light where it is (explosion puffs glow).
+    bright: bool,
 }
 
 #[derive(Default)]
 pub struct Particles {
     list: Vec<Particle>,
     rng: u64,
+    /// Frames of the explosion and smoke sheets (set once the atlas is known).
+    pub sheets: [Vec<[f32; 4]>; 2],
+    /// `HugeExplosionSeedParticle`s: center and ticks left.
+    emitters: Vec<(Vec3, u32)>,
 }
 
 impl Particles {
@@ -52,7 +62,7 @@ impl Particles {
         let size = 0.1 * (self.random() * 0.5 + 0.5) * 2.0 / 2.0 * scale;
         let uv = self.piece(rect);
         if self.list.len() < 4000 {
-            self.list.push(Particle { pos, prev: pos, vel: v, age: 0, life, size, uv, tint, on_ground: false });
+            self.list.push(Particle { pos, prev: pos, vel: v, age: 0, life, size, uv, tint, on_ground: false, sheet: 0, gravity: 0.04, bright: false });
         }
     }
 
@@ -85,15 +95,55 @@ impl Particles {
         self.spawn(p, Vec3::ZERO, rect, tint, 0.2, 0.6);
     }
 
+    /// An explosion (ClientPacketListener.handleExplosion): a big one is `explosion_emitter`, which puffs for 8
+    /// ticks, a small one a single `explosion` puff; then smoke drifts up from around it.
+    pub fn explosion(&mut self, center: Vec3, radius: f32) {
+        if radius >= 2.0 {
+            self.emitters.push((center, 8));
+        } else {
+            self.puff(center, 0.0);
+        }
+        for _ in 0..(radius * 6.0) as usize {
+            let off = Vec3::new(self.random() - 0.5, self.random() - 0.5, self.random() - 0.5) * radius * 2.0;
+            let vel = Vec3::new(self.random() - 0.5, self.random() * 0.5, self.random() - 0.5) * 0.1;
+            let gray = (self.random() * 0.3 + 0.7) * 255.0;
+            let life = 8 + (self.random() * 24.0) as u32;
+            let size = 0.25 * (self.random() * 0.5 + 0.75);
+            self.add(Particle { pos: center + off, prev: center + off, vel, age: 0, life, size, uv: [0.0; 4], tint: [gray as u8; 3], on_ground: false, sheet: 2, gravity: -0.004, bright: false });
+        }
+    }
+
+    /// `HugeExplosionParticle`: a gray puff that plays the explosion sheet, `age` 0..1 of its emitter's life.
+    fn puff(&mut self, pos: Vec3, age: f32) {
+        let gray = ((self.random() * 0.6 + 0.4) * 255.0) as u8;
+        let life = 6 + (self.random() * 4.0) as u32;
+        self.add(Particle { pos, prev: pos, vel: Vec3::ZERO, age: 0, life, size: 2.0 * (1.0 - age * 0.5), uv: [0.0; 4], tint: [gray; 3], on_ground: false, sheet: 1, gravity: 0.0, bright: true });
+    }
+
+    fn add(&mut self, p: Particle) {
+        if self.list.len() < 4000 {
+            self.list.push(p);
+        }
+    }
+
     /// One tick: gravity, drag and a simple stop on solid blocks.
     pub fn tick(&mut self, solid: impl Fn(i32, i32, i32) -> bool) {
+        for i in 0..self.emitters.len() {
+            let (c, left) = self.emitters[i];
+            for _ in 0..6 {
+                let off = Vec3::new(self.random() - self.random(), self.random() - self.random(), self.random() - self.random()) * 4.0;
+                self.puff(c + off, (8 - left) as f32 / 8.0);
+            }
+            self.emitters[i].1 -= 1;
+        }
+        self.emitters.retain(|e| e.1 > 0);
         self.list.retain_mut(|p| {
             p.prev = p.pos;
             p.age += 1;
             if p.age >= p.life {
                 return false;
             }
-            p.vel.y -= 0.04;
+            p.vel.y -= p.gravity;
             let next = p.pos + p.vel;
             let below = |v: Vec3| solid(v.x.floor() as i32, v.y.floor() as i32, v.z.floor() as i32);
             if below(next) {
@@ -126,10 +176,14 @@ impl Particles {
         let mut out = Vec::with_capacity(self.list.len() * 6);
         for p in &self.list {
             let c = p.prev.lerp(p.pos, t);
-            let b = light(c) * 0.6 + 0.0;
+            let b = if p.bright { 1.0 } else { light(c) * 0.6 };
             let col = [(p.tint[0] as f32 * b) as u8, (p.tint[1] as f32 * b) as u8, (p.tint[2] as f32 * b) as u8, 255];
             let (r, u) = (right * p.size, up * p.size);
-            let [u0, v0, u1, v1] = p.uv;
+            // SpriteSet.get(age, lifetime): the frame for how far through its life it is.
+            let [u0, v0, u1, v1] = match self.sheets.get(p.sheet as usize - 1).filter(|_| p.sheet > 0) {
+                Some(frames) if !frames.is_empty() => frames[(p.age as usize * (frames.len() - 1)) / p.life.max(1) as usize],
+                _ => p.uv,
+            };
             let v = |pos: Vec3, uv: [f32; 2]| Vertex { pos: pos.into(), uv, color: col };
             let q = [v(c - r + u, [u0, v0]), v(c - r - u, [u0, v1]), v(c + r - u, [u1, v1]), v(c + r + u, [u1, v0])];
             out.extend_from_slice(&[q[0], q[1], q[2], q[0], q[2], q[3]]);

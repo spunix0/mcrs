@@ -21,6 +21,7 @@ impl Game {
     }
 
     pub(super) fn blocks_changed(&mut self, changes: Vec<([i32; 3], u16)>) {
+        let positions: Vec<[i32; 3]> = changes.iter().map(|c| c.0).collect();
         for ([x, y, z], state) in changes {
             let (cx, cz) = (x.div_euclid(16), z.div_euclid(16));
             let Some(chunk) = self.world.get_mut(&(cx, cz)) else { continue };
@@ -47,6 +48,21 @@ impl Game {
                     if dz == 0 || (dz == -1 && lz == 0) || (dz == 1 && lz == 15) {
                         self.mark(cx + dx, cz + dz, sections);
                     }
+                }
+            }
+        }
+        // The server only sends light at the view-distance edge; vanilla clients relight block changes themselves.
+        let models = self.models.clone();
+        let info = |s: u16| models.states.get(s as usize);
+        let touched = mc_world::relight::relight(&mut self.world, &positions, |s| info(s).map_or(0, |m| m.light), |s| info(s).map_or(0, |m| m.light_block));
+        for [x, sy, z] in touched {
+            // Smooth lighting reads one block past each face, so the sections around count too.
+            for dx in -1..=1 {
+                for dz in -1..=1 {
+                    let Some(min) = self.world.get(&(x + dx, z + dz)).map(|c| c.min_section) else { continue };
+                    let si = sy - min;
+                    let bits = [si - 1, si, si + 1].into_iter().filter(|s| (0..64).contains(s)).fold(0u64, |m, s| m | 1 << s);
+                    self.mark(x + dx, z + dz, bits);
                 }
             }
         }
@@ -107,6 +123,12 @@ impl Game {
         }
     }
 
+    /// Vanilla's swim and splash loudness: speed (vertical counted fully) times `scale`, at most 1.
+    fn water_speed(&self, scale: f64) -> f32 {
+        let [x, y, z] = self.body.vel;
+        ((x * x * 0.2 + y * y + z * z * 0.2).sqrt() * scale).min(1.0) as f32
+    }
+
     pub fn feet(&self) -> [f64; 3] {
         let [x, y, z] = self.cam.eye;
         [x, y - EYE_HEIGHT, z]
@@ -121,7 +143,13 @@ impl Game {
         match self.last_jump_press {
             Some(t) if t.elapsed() < DOUBLE_TAP => {
                 self.last_jump_press = None;
-                self.toggle_mode();
+                if self.may_fly && self.mode == Mode::Walk && self.game_mode != 3 {
+                    // Creative flight (LocalPlayer.aiStep's jump double-tap).
+                    self.body.flying = !self.body.flying;
+                    let _ = session::send_flying(&self.tx, self.body.flying);
+                } else {
+                    self.toggle_mode();
+                }
             }
             _ => self.last_jump_press = Some(Instant::now()),
         }
@@ -326,18 +354,62 @@ impl Game {
             }
         }
 
-        if c.use_item && self.use_cooldown == 0 {
+        // An item in use (eating, drinking, drawing a bow) runs until done or until right click is let go.
+        if let Some((item, since)) = self.using {
+            let duration = hand::use_animation(&self.models.items[item as usize].name).map_or(0.0, |u| u.1);
+            let ticks = since.elapsed().as_secs_f32() * 20.0;
+            if !c.use_item || self.held().map(|s| s.item) != Some(item) {
+                self.using = None;
+                let _ = session::send_release_use(&self.tx);
+            } else if ticks >= duration {
+                // Finished eating: holding on starts the next bite.
+                self.using = None;
+            }
+        }
+        if c.use_item && self.use_cooldown == 0 && self.using.is_none() {
             let seq = self.next_sequence();
-            let holding_block = self.held().and_then(|s| self.models.items.get(s.item as usize)).is_some_and(|i| i.block);
+            let held = self.held().and_then(|s| self.models.items.get(s.item as usize)).map(|i| (i.block, i.name.clone()));
+            let holding_block = held.as_ref().is_some_and(|h| h.0);
+            // LivingEntity.startUsingItem, predicted like vanilla's client: food only when it can be eaten.
+            if let (Some(stack), Some((_, name))) = (self.held(), &held) {
+                let can_eat = self.game_mode == 1 || self.food < 20 || matches!(name.as_str(), "golden_apple" | "enchanted_golden_apple" | "chorus_fruit" | "suspicious_stew");
+                let arrows = self.game_mode == 1 || self.inventory.slots.iter().flatten().any(|s| self.models.items.get(s.item as usize).is_some_and(|i| i.name.ends_with("arrow")));
+                let starts = match hand::use_animation(name) {
+                    Some((hand::UseAnim::Eat, _)) => can_eat || !hand::is_food(name),
+                    Some((hand::UseAnim::Bow, _)) => arrows,
+                    None => false,
+                };
+                let aiming_at_use = target.is_some_and(|(pos, _, _)| interactive(&self.models.states.get(self.state_at(pos) as usize).map_or("", |s| &s.block)));
+                if starts && !aiming_at_use {
+                    self.using = Some((stack.item, Instant::now()));
+                }
+            }
             match target {
                 Some((pos, face, point)) => {
                     let o = [[0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]][face as usize % 6];
-                    self.pending_place = Some(([pos[0] + o[0], pos[1] + o[1], pos[2] + o[2]], Instant::now()));
+                    if holding_block {
+                        self.pending_place = Some(([pos[0] + o[0], pos[1] + o[1], pos[2] + o[2]], Instant::now()));
+                    }
                     let _ = session::send_use_on(&self.tx, pos, face, point, seq);
+                    let item = held.map(|h| h.1).unwrap_or_default();
+                    let target_block = self.models.states.get(self.state_at(pos) as usize).map(|s| s.block.clone()).unwrap_or_else(|| "air".into());
+                    if let Some(event) = use_sound(&item, &target_block) {
+                        // The server plays these to everyone but the user, so the client plays its own (vanilla too).
+                        let at = [pos[0] as f64 + 0.5, pos[1] as f64 + 0.5, pos[2] as f64 + 0.5];
+                        let pitch = if item == "flint_and_steel" { self.rand() * 0.4 + 0.8 } else { 1.0 };
+                        self.sound(event, Some(at), 1.0, pitch, category::PLAYERS);
+                        self.start_swing();
+                    } else if interactive(&target_block) {
+                        self.start_swing();
+                    }
                     if holding_block {
                         self.start_swing();
                         // Placing re-raises the hand from the bottom, as vanilla's `itemUsed`.
                         self.main_height = 0.0;
+                    } else if !interactive(&target_block) && !item.is_empty() {
+                        // MultiPlayerGameMode: when using on the block did nothing, the item is used on its own too.
+                        let seq = self.next_sequence();
+                        let _ = session::send_use(&self.tx, seq, [self.cam.yaw, self.cam.pitch]);
                     }
                 }
                 None => {
@@ -458,12 +530,42 @@ impl Game {
         self.fov_mod_o = self.fov_mod;
         let target_fov = if self.mode == Mode::Fly { 1.1 } else if c.sprint && c.forward > 0.0 { 1.15 } else { 1.0 };
         self.fov_mod += (target_fov - self.fov_mod) * 0.5;
-        self.entities.tick();
         let world = WorldView { chunks: &self.world, models: &self.models };
-        self.particles.tick(|x, y, z| world.state(x, y, z).is_some_and(|s| !s.collision.is_empty()));
+        let solid = |x, y, z| world.state(x, y, z).is_some_and(|s| !s.collision.is_empty());
+        self.entities.tick(solid, |x, y, z| world.state(x, y, z).is_some_and(|s| s.fluid == Some(mc_assets::Fluid::Water)));
+        self.particles.tick(solid);
         self.sky.tick();
         // Water vision: grows while the eyes are underwater, fades fast after.
-        self.water_time = if self.eye_fluid() == Some(mc_assets::Fluid::Water) { (self.water_time + 1.0).min(600.0) } else { (self.water_time - 10.0).max(0.0) };
+        let under = self.eye_fluid() == Some(mc_assets::Fluid::Water);
+        self.water_time = if under { (self.water_time + 1.0).min(600.0) } else { (self.water_time - 10.0).max(0.0) };
+        // LocalPlayer's enter/exit sounds and UnderwaterAmbientSoundHandler's random additions (the loop is in the app).
+        if under != self.eyes_in_water {
+            self.eyes_in_water = under;
+            let event = if under { "ambient.underwater.enter" } else { "ambient.underwater.exit" };
+            self.sound(event, None, 1.0, 1.0, category::AMBIENT);
+        }
+        // Hud.extractAirBubbles: each bubble that bursts underwater pops, louder and higher as the air runs out.
+        let air = self.air.clamp(0, 300);
+        let bubble = |offset: i32| ((air + offset) as f32 * 10.0 / 300.0).ceil().max(0.0) as i32;
+        if under {
+            let (full, popping) = (bubble(-2), bubble(0));
+            let empty = 10 - bubble(if air != 0 { 1 } else { 0 });
+            if full != popping && self.last_bubble != popping {
+                self.last_bubble = popping;
+                let volume = 0.5 + 0.1 * (empty - 2).max(0) as f32;
+                let pitch = 1.0 + 0.1 * (empty - 4).max(0) as f32;
+                self.sound("ui.hud.bubble_pop", Some(self.feet()), volume, pitch, category::PLAYERS);
+            }
+        } else {
+            self.last_bubble = 0;
+        }
+        if under {
+            let r = self.rand();
+            let extra = if r < 1e-4 { "ambient.underwater.loop.additions.ultra_rare" } else if r < 1e-3 { "ambient.underwater.loop.additions.rare" } else { "ambient.underwater.loop.additions" };
+            if r < 0.01 {
+                self.sound(extra, None, 1.0, 1.0, category::AMBIENT);
+            }
+        }
         if self.action_bar.as_ref().is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(3)) {
             self.action_bar = None;
         }
@@ -472,7 +574,9 @@ impl Game {
     fn walk_tick(&mut self, input: &Input) {
         self.prev_feet = self.body.pos;
         let world = WorldView { chunks: &self.world, models: &self.models };
+        let was_flying = self.body.flying;
         self.body.tick(input, self.cam.yaw, &world);
+        let wet = self.body.in_water(&world);
         let (dx, dz) = (self.body.pos[0] - self.prev_feet[0], self.body.pos[2] - self.prev_feet[2]);
         let horizontal = (dx * dx + dz * dz).sqrt();
         // View bob: walkDist grows by 0.6 per block, bob eases toward the horizontal speed (capped at 0.1).
@@ -490,6 +594,27 @@ impl Game {
                 let below = [x.floor() as i32, (y - 0.2).floor() as i32, z.floor() as i32];
                 self.block_sound(below, None, |s| &s.step, |v| v * 0.15, 1.0);
             }
+        } else if wet {
+            // Entity.waterSwimSound: one per step of distance, louder the faster you move.
+            self.walked += horizontal * 0.6;
+            if self.walked > self.next_step {
+                self.next_step = self.walked.floor() + 1.0;
+                let volume = self.water_speed(0.35);
+                let pitch = 1.0 + (self.rand() - self.rand()) * 0.4;
+                self.sound("entity.player.swim", Some(self.body.pos), volume, pitch, category::PLAYERS);
+            }
+        }
+        if wet && !self.touching_water {
+            // Entity.doWaterSplashEffect.
+            let volume = self.water_speed(0.2);
+            let event = if volume < 0.25 { "entity.player.splash" } else { "entity.player.splash.high_speed" };
+            let pitch = 1.0 + (self.rand() - self.rand()) * 0.4;
+            self.sound(event, Some(self.body.pos), volume, pitch, category::PLAYERS);
+        }
+        self.touching_water = wet;
+        if was_flying && !self.body.flying {
+            // Landed.
+            let _ = session::send_flying(&self.tx, false);
         }
         let sprinting = input.sprint && input.forward > 0.0;
         if sprinting != self.sprinting {
@@ -633,6 +758,10 @@ impl Game {
                 inverse_height: 1.0 - lerp(self.o_main_height, self.main_height, t),
                 sway: [(self.cam.pitch - lerp(self.x_bob_o, self.x_bob, t)) * 0.1, (self.cam.yaw - lerp(self.y_bob_o, self.y_bob, t)) * 0.1],
                 light: light_fn(self.cam.eye),
+                using: self.using.and_then(|(item, since)| {
+                    let (anim, duration) = hand::use_animation(&models.items.get(item as usize)?.name)?;
+                    Some((anim, since.elapsed().as_secs_f32() * 20.0, duration))
+                }),
             };
             match self.shown_item.and_then(|i| models.items.get(i as usize)) {
                 Some(item) if item.model.is_some() => hand::item(&mut ov.hand_item, &pose, item),
@@ -905,4 +1034,36 @@ fn chunk_borders(out: &mut Vec<LineVertex>, eye: [f64; 3], min_section: i32) {
         }
         y += 16.0;
     }
+}
+
+/// The sound an item makes when used on `block`, which the server leaves out for the user (vanilla `useOn` plays it
+/// with the player as the excluded source).
+fn use_sound(item: &str, block: &str) -> Option<&'static str> {
+    let log = (block.ends_with("_log") || block.ends_with("_wood") || block.ends_with("_stem") || block.ends_with("_hyphae") || block == "bamboo_block") && !block.starts_with("stripped_");
+    Some(match item {
+        "flint_and_steel" => "item.flintandsteel.use",
+        "fire_charge" => "item.firecharge.use",
+        "water_bucket" => "item.bucket.empty",
+        "lava_bucket" => "item.bucket.empty_lava",
+        "powder_snow_bucket" => "item.bucket.empty_powder_snow",
+        "axolotl_bucket" => "item.bucket.empty_axolotl",
+        "tadpole_bucket" => "item.bucket.empty_tadpole",
+        i if i.ends_with("_bucket") && i != "milk_bucket" => "item.bucket.empty_fish",
+        i if i.ends_with("_hoe") && matches!(block, "grass_block" | "dirt" | "dirt_path" | "coarse_dirt" | "rooted_dirt") => "item.hoe.till",
+        i if i.ends_with("_axe") && log => "item.axe.strip",
+        i if i.ends_with("_shovel") && matches!(block, "grass_block" | "dirt" | "podzol" | "mycelium" | "coarse_dirt" | "rooted_dirt") => "item.shovel.flatten",
+        _ => return None,
+    })
+}
+
+/// Blocks that do something when used, so the arm swings like vanilla's successful `useItemOn`.
+fn interactive(block: &str) -> bool {
+    const ENDS: [&str; 7] = ["_door", "_trapdoor", "_fence_gate", "_button", "_bed", "shulker_box", "_sign"];
+    const NAMES: [&str; 30] = [
+        "lever", "chest", "trapped_chest", "ender_chest", "barrel", "furnace", "smoker", "blast_furnace", "crafting_table", "anvil",
+        "chipped_anvil", "damaged_anvil", "repeater", "comparator", "note_block", "hopper", "dispenser", "dropper", "enchanting_table",
+        "brewing_stand", "smithing_table", "loom", "cartography_table", "grindstone", "stonecutter", "lectern", "bell", "cake",
+        "beacon", "daylight_detector",
+    ];
+    ENDS.iter().any(|e| block.ends_with(e)) || NAMES.contains(&block) || matches!(block, "crafter" | "jukebox" | "composter" | "respawn_anchor")
 }
