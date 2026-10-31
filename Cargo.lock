@@ -2178,6 +2178,7 @@ dependencies = [
 name = "mc-world"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "mc-nbt",
 ]
 

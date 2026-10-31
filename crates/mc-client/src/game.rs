@@ -10,7 +10,7 @@ use crate::hud::{self, Painter};
 use crate::inventory::{self, Click, Inventory, Menu, MenuKind, Stack};
 use crate::models;
 use crate::options::Options;
-use crate::particles::Particles;
+use crate::particles::{self, Particles};
 use crate::physics::{self, Aabb, Body, Input};
 use crate::session::{self, Dig, Event, SoundRef};
 use crate::sky::{Dimension, Sky};
@@ -272,6 +272,13 @@ pub struct Game {
     pub eyes_in_water: bool,
     /// The air bubble that last popped (vanilla's `lastBubblePopSoundPlayed`).
     last_bubble: i32,
+    /// Cutout Leaves is off; changing it remeshes everything.
+    pub solid_leaves: bool,
+    /// On servers, every chunk's surface kept for distant terrain.
+    lod_cache: Option<crate::lod::Cache>,
+    /// Hud heart state: game ticks, health last tick, the health shown in white (`displayHealth`) and since when,
+    /// and the tick the blinking stops.
+    hearts: (u64, i32, i32, Instant, u64),
     /// The item being used (eaten, drunk, drawn) and since when.
     using: Option<(u32, Instant)>,
     rng: u64,
@@ -318,7 +325,7 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 
 impl Game {
     pub fn new(models: Arc<BlockModels>, tx: mc_protocol::Sender, net: Receiver<Event>, ended: Arc<Mutex<Option<String>>>, noclip: bool) -> Self {
-        let sheets = [models.explosion_uv.clone(), models.smoke_uv.clone()];
+        let (sprites, names) = (models.particle_sprites.clone(), models.particle_types.clone());
         let (jobs, job_rx) = channel::<(u64, Area)>();
         let (mesh_tx, meshes) = channel();
         let job_rx = Arc::new(Mutex::new(job_rx));
@@ -381,7 +388,7 @@ impl Game {
             rain: 0.0,
             particles: {
                 let mut p = Particles::default();
-                p.sheets = sheets;
+                (p.sprites, p.names) = (sprites, names);
                 p
             },
             sounds: Vec::new(),
@@ -429,6 +436,9 @@ impl Game {
             touching_water: false,
             eyes_in_water: false,
             last_bubble: 0,
+            solid_leaves: false,
+            lod_cache: None,
+            hearts: (0, 20, 20, Instant::now(), 0),
             using: None,
             rng: 0x2545_f491_4f6c_dd1d ^ Instant::now().elapsed().as_nanos() as u64 ^ std::process::id() as u64,
             creative: None,
@@ -459,6 +469,39 @@ impl Game {
         }
     }
 
+    pub fn lod_cache_dir(&self) -> Option<std::path::PathBuf> {
+        self.lod_cache.as_ref().map(|c| c.dir().to_path_buf())
+    }
+
+    /// Keeps (or stops keeping) the surface of received chunks in `dir`, for distant terrain on servers.
+    pub fn set_lod_cache(&mut self, dir: Option<std::path::PathBuf>) {
+        if self.lod_cache.as_ref().map(|c| c.dir()) == dir.as_deref() {
+            return;
+        }
+        self.lod_cache = dir.map(crate::lod::Cache::new);
+        if let Some(cache) = &mut self.lod_cache {
+            for chunk in self.world.values() {
+                cache.record(chunk, &self.models);
+            }
+        }
+    }
+
+    /// Video settings that change how things are built: Cutout Leaves (remeshes every chunk) and the particle amount.
+    pub fn graphics(&mut self, cutout_leaves: bool, particles: u8) {
+        self.particles.amount = match particles {
+            1 => particles::Amount::Decreased,
+            2 => particles::Amount::Minimal,
+            _ => particles::Amount::All,
+        };
+        if self.solid_leaves == cutout_leaves {
+            self.solid_leaves = !cutout_leaves;
+            let keys: Vec<(i32, i32)> = self.world.keys().copied().collect();
+            for (x, z) in keys {
+                self.mark(x, z, u64::MAX);
+            }
+        }
+    }
+
     /// Sends every dirty, loaded chunk to the meshers along with its neighbors, nearest first.
     fn dispatch(&mut self) {
         let mut dirty: Vec<_> = std::mem::take(&mut self.dirty).into_iter().collect();
@@ -480,7 +523,7 @@ impl Game {
             }
             self.next_version += 1;
             self.versions.insert(key, (self.next_version, mask));
-            let _ = self.jobs.send((self.next_version, Area { center, around, mask }));
+            let _ = self.jobs.send((self.next_version, Area { center, around, mask, solid_leaves: self.solid_leaves }));
         }
     }
 
@@ -550,6 +593,9 @@ impl Game {
                 }
                 Event::Chunk(c) => {
                     let key = (c.x, c.z);
+                    if let Some(cache) = &mut self.lod_cache {
+                        cache.record(&c, &self.models);
+                    }
                     self.world.insert(key, Arc::new(c));
                     // Neighbors can now cull their border faces and smooth their border light.
                     self.mark_around(key.0, key.1, u64::MAX);
@@ -595,6 +641,19 @@ impl Game {
                     if let Some(name) = name {
                         self.sound(&name, at, volume, pitch, category);
                     }
+                }
+                Event::Particles { kind, data, pos, dist, speed, count, mode, always } => {
+                    let mut ps = std::mem::take(&mut self.particles);
+                    {
+                        let look = |d: &particles::Data| match d {
+                            particles::Data::Block(s) => self.particle_texture(*s),
+                            particles::Data::Item(i) => self.models.items.get(*i as usize).and_then(|it| it.icon).map(|r| (r, [255; 3])),
+                            _ => None,
+                        };
+                        let at = Vec3::new(pos[0] as f32, pos[1] as f32, pos[2] as f32);
+                        ps.packet(kind, &data, at, Vec3::from(dist), Vec3::from(speed), count, mode, always, &look);
+                    }
+                    self.particles = ps;
                 }
                 Event::Explode { center, radius, knockback, sound } => {
                     // ClientPacketListener.handleExplosion: the sound at volume 4, the particles, and our push.

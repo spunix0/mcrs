@@ -441,6 +441,14 @@ impl Baker {
         Some((self.texture(&model, &format!("#{key}")), model_name.contains("block/")))
     }
 
+    /// Puts a texture in the atlas even though no model uses it (particles).
+    pub fn add_texture(&mut self, name: &str) {
+        if !self.texture_ids.contains_key(name) {
+            self.texture_ids.insert(name.to_string(), self.textures.len());
+            self.textures.push(name.to_string());
+        }
+    }
+
     /// Loads every referenced texture (plus fluids) and packs the atlas.
     pub fn stitch(&mut self, jar: &mut Jar) -> anyhow::Result<Atlas> {
         let fluids = ["water_still", "lava_still", "water_flow", "lava_flow"].map(|t| format!("minecraft:block/{t}"));

@@ -164,7 +164,9 @@ impl Atlas {
 
         let all = std::iter::once("minecraft:missingno".to_string()).chain(names.iter().cloned());
         for (i, name) in all.enumerate() {
-            let px = load_tile(jar, &name).unwrap_or_else(|| {
+            // `mcrs:white` is a plain white tile for things colored by their vertices (distant terrain).
+            let white = (name == "mcrs:white").then(|| vec![255u8; TILE * TILE * 4]);
+            let px = white.or_else(|| load_tile(jar, &name)).unwrap_or_else(|| {
                 if i > 0 && name != "minecraft:missingno" {
                     missing_names.push(name.clone());
                 }

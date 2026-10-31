@@ -104,6 +104,7 @@ pub mod play {
         pub const GAME_EVENT: i32 = 39;
         pub const KEEP_ALIVE: i32 = 45;
         pub const LEVEL_CHUNK_WITH_LIGHT: i32 = 46;
+        pub const LEVEL_PARTICLES: i32 = 48;
         pub const LOGIN: i32 = 50;
         pub const PING: i32 = 62;
         pub const PLAYER_POSITION: i32 = 73;

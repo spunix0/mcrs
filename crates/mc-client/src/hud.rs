@@ -338,8 +338,12 @@ pub struct Status {
     pub air: i32,
     pub xp_progress: f32,
     pub xp_level: i32,
-    /// Ticks since the last hurt, for the heart flash.
+    /// Hearts flash (Hud's `healthBlinkTime`): white outlines, and the health just lost shown in white.
     pub blink: bool,
+    /// Health a second ago (`displayHealth`), drawn as white hearts while blinking.
+    pub old_health: i32,
+    /// Game tick, for the low-health jitter.
+    pub tick: u64,
 }
 
 /// Hearts, hunger, air and the experience bar, as vanilla's `Gui.renderPlayerHealth` and `renderExperienceBar`.
@@ -364,20 +368,26 @@ pub fn status(p: &mut Painter, s: &Status) {
     }
 
     let y = p.height - 39.0;
+    // Hud.extractHearts: container, then the lost health in white while blinking, then the current health.
     let hp = s.health.ceil().max(0.0) as i32;
-    let (full, half) = if s.hardcore { ("heart_hardcore_full", "heart_hardcore_half") } else { ("heart_full", "heart_half") };
-    for i in 0..10 {
+    let hc = if s.hardcore { "_hardcore" } else { "" };
+    let heart = |half: bool, blinking: bool| format!("heart{hc}_{}{}", if half { "half" } else { "full" }, if blinking { "_blinking" } else { "" });
+    let container = format!("heart_container{hc}{}", if s.blink { "_blinking" } else { "" });
+    for i in 0..10i32 {
         let x = x0 + i as f32 * 8.0;
-        // Low health makes the hearts jitter.
-        let jitter = if hp <= 4 && (i * 7 + (s.health * 13.0) as i32) % 3 == 0 { -1.0 } else { 0.0 };
-        p.sprite("heart_container", x, y + jitter);
-        if !s.blink || i % 2 == 0 {
-            if hp >= (i + 1) * 2 {
-                p.sprite(full, x, y + jitter);
-            } else if hp == i * 2 + 1 {
-                p.sprite(half, x, y + jitter);
-            }
+        // At 4 health or less each heart hops a pixel at random every tick.
+        let roll = (s.tick.wrapping_mul(312871) ^ (i as u64).wrapping_mul(0x9e37_79b9)).wrapping_mul(0x2545_f491_4f6c_dd1d) >> 63;
+        let y = y + if hp <= 4 { roll as f32 } else { 0.0 };
+        p.sprite(&container, x, y);
+        let halves = i * 2;
+        if s.blink && halves < s.old_health {
+            p.sprite(&heart(halves + 1 == s.old_health, true), x, y);
         }
+        if halves < hp {
+            p.sprite(&heart(halves + 1 == hp, false), x, y);
+        }
+    }
+    for i in 0..10 {
         let fx = center + 91.0 - 9.0 - i as f32 * 8.0;
         p.sprite("food_empty", fx, y);
         if s.food >= (i + 1) * 2 {

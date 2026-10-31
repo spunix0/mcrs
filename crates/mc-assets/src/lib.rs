@@ -118,6 +118,12 @@ pub struct StateModel {
     pub collision: Arc<Vec<[f32; 6]>>,
     /// Ground slipperiness (0.6 for most blocks).
     pub friction: f32,
+    /// Leaves (drawn solid when Cutout Leaves is off).
+    pub leaves: bool,
+    /// Block properties the particle effects need: `lit`, horizontal `facing` as (x, z), and `candles`.
+    pub lit: bool,
+    pub facing: [i8; 2],
+    pub candles: u8,
     /// Light the block gives off, 0..15.
     pub light: u8,
     /// How much light it takes away passing through (vanilla `getLightBlock`): 15 opaque, 1 water and leaves.
@@ -284,14 +290,23 @@ impl StateModel {
 }
 
 /// Blocks you can walk through even though their model has solid-looking boxes.
-const NO_COLLISION: &[&str] = &[
-    "torch", "sign", "banner", "button", "pressure_plate", "lever", "fire", "tripwire", "portal", "light", "structure_void", "powder_snow",
-];
+/// Blocks you walk through (`.noCollision()`), extracted from Blocks.java by `tools/no_collision.pl`.
+fn no_collision() -> std::collections::HashSet<&'static str> {
+    include_str!("../data/no_collision.txt").lines().map(str::trim).filter(|l| !l.is_empty()).collect()
+}
 
-fn collision_for(block: &str, boxes: Vec<[f32; 6]>) -> Vec<[f32; 6]> {
-    if NO_COLLISION.iter().any(|n| block.contains(n)) {
+/// Collision boxes from the model's elements, with vanilla's shape where the model is misleading.
+fn collision_for(block: &str, boxes: Vec<[f32; 6]>, walk_through: &std::collections::HashSet<&str>) -> Vec<[f32; 6]> {
+    if walk_through.contains(block) || block == "powder_snow" {
         return Vec::new();
     }
+    if block.ends_with("campfire") {
+        // CampfireBlock.SHAPE: a 7/16 slab (the model's flames aren't solid).
+        return vec![[0.0, 0.0, 0.0, 1.0, 7.0 / 16.0, 1.0]];
+    }
+    // Paper-thin planes (cross-shaped plants, flames) aren't solid when the block has real boxes too.
+    let thick: Vec<[f32; 6]> = boxes.iter().copied().filter(|b| (0..3).all(|i| b[i + 3] - b[i] > 1e-3)).collect();
+    let boxes = if thick.is_empty() { boxes } else { thick };
     // Fences and walls (posts and arms alike) collide as 1.5-block-tall columns so you can't jump them.
     let tall = block.ends_with("_fence") || block.ends_with("_wall");
     boxes
@@ -395,6 +410,13 @@ pub struct BlockModels {
     /// Particle animation frames: the explosion puff (16) and generic smoke (8).
     pub explosion_uv: Vec<[f32; 4]>,
     pub smoke_uv: Vec<[f32; 4]>,
+    /// Particle types by protocol ID (no namespace) and the sprites of each.
+    pub particle_types: Vec<String>,
+    pub particle_sprites: Vec<Vec<[f32; 4]>>,
+    /// Block name to how it looks from afar (distant terrain).
+    pub lod_faces: HashMap<String, LodFace>,
+    /// A plain white tile in the atlas.
+    pub white_uv: [f32; 4],
     /// Indexed by item protocol ID.
     pub items: Vec<ItemInfo>,
     /// Data component type name (without `minecraft:`) to protocol ID.
@@ -503,7 +525,8 @@ fn tint_for(block: &str, props: &[(String, String)]) -> [u8; 3] {
         "spruce_leaves" => [0x61, 0x99, 0x61],
         "lily_pad" => [0x20, 0x80, 0x30],
         "oak_leaves" | "jungle_leaves" | "acacia_leaves" | "dark_oak_leaves" | "mangrove_leaves" | "vine" => FOLIAGE,
-        "leaf_litter" => [0x5c, 0x3c, 0x32],
+        // The dry foliage colormap at the same (plains) climate as GRASS and FOLIAGE.
+        "leaf_litter" => [0xa3, 0x75, 0x46],
         "water" | "bubble_column" | "water_cauldron" => WATER,
         "attached_melon_stem" | "attached_pumpkin_stem" => [0xe0, 0xc7, 0x1c],
         "melon_stem" | "pumpkin_stem" => {
@@ -552,7 +575,22 @@ impl BlockModels {
             resolved.push(baked);
         }
         let item_defs: Vec<Option<model::ItemModelDef>> = item_names.iter().map(|n| baker.item_model(&mut jar, n)).collect();
+        // Particles: `particles/<type>.json` lists the sprites each type picks from or animates through.
+        let particle_types = load_registry(&registries, "minecraft:particle_type");
+        let particle_textures: Vec<Vec<String>> = particle_types
+            .iter()
+            .map(|n| {
+                let list = jar.json(&format!("assets/minecraft/particles/{n}.json")).and_then(|j| j["textures"].as_array().cloned()).unwrap_or_default();
+                list.iter().filter_map(|t| t.as_str()).map(|t| format!("minecraft:particle/{}", t.trim_start_matches("minecraft:"))).collect()
+            })
+            .collect();
+        for t in particle_textures.iter().flatten() {
+            baker.add_texture(t);
+        }
+        baker.add_texture("mcrs:white");
         let atlas = baker.stitch(&mut jar)?;
+        let white_uv = atlas.rect("mcrs:white");
+        let particle_sprites = particle_textures.iter().map(|list| list.iter().map(|t| atlas.rect(t)).collect()).collect();
         let items = item_names
             .iter()
             .zip(item_defs)
@@ -594,11 +632,12 @@ impl BlockModels {
         let smoke_uv = (0..8).map(|i| atlas.rect(&format!("minecraft:particle/generic_{i}"))).collect();
 
         let hardness = hardness_table();
+        let walk_through = no_collision();
         let light: HashMap<&str, &str> = include_str!("../data/light.tsv").lines().filter_map(|l| l.split_once('\t')).collect();
         let tools = ToolRules::load(&mut jar);
         let mut names: HashMap<String, Arc<str>> = HashMap::new();
         let mut sounds: HashMap<String, Arc<str>> = HashMap::new();
-        let states = states
+        let states: Vec<StateModel> = states
             .iter()
             .zip(resolved)
             .map(|(s, parts)| {
@@ -626,8 +665,18 @@ impl BlockModels {
                     fluid,
                     fluid_level: s.props.iter().find(|(k, _)| k == "level").and_then(|(_, v)| v.parse().ok()).unwrap_or(0),
                     tint: tint_for(&s.block, &s.props),
-                    collision: Arc::new(if is_air { Vec::new() } else { collision_for(&s.block, boxes) }),
+                    collision: Arc::new(if is_air { Vec::new() } else { collision_for(&s.block, boxes, &walk_through) }),
                     friction: friction_for(&s.block),
+                    leaves: s.block.ends_with("_leaves"),
+                    lit: s.props.iter().any(|(k, v)| k == "lit" && v == "true"),
+                    facing: match s.props.iter().find(|(k, _)| k == "facing").map(|(_, v)| v.as_str()) {
+                        Some("north") => [0, -1],
+                        Some("south") => [0, 1],
+                        Some("west") => [-1, 0],
+                        Some("east") => [1, 0],
+                        _ => [0, 0],
+                    },
+                    candles: s.props.iter().find(|(k, _)| k == "candles").and_then(|(_, v)| v.parse().ok()).unwrap_or(0),
                     light: light_emission(&light, &s.block, &s.props),
                     light_block: if opaque && !is_air || s.block == "tinted_glass" {
                         15
@@ -644,7 +693,36 @@ impl BlockModels {
                 }
             })
             .collect();
-        Ok(Self { states, atlas, water_uv, lava_uv, water_flow_uv, lava_flow_uv, crack_uv, explosion_uv, smoke_uv, items, components, gui, sound_types: sound_types(), sound_events, entities, lang, menus })
+        // How each block looks from afar (distant terrain): its top and side textures' atlas tiles and tints.
+        let tile_of = |uv: [[f32; 2]; 4]| -> u16 {
+            let u = uv.iter().map(|p| p[0]).fold(f32::MAX, f32::min);
+            let v = uv.iter().map(|p| p[1]).fold(f32::MAX, f32::min);
+            let (tx, ty) = ((u * atlas.width as f32) as u32 / 16, (v * atlas.height as f32) as u32 / 16);
+            (ty * (atlas.width / 16) + tx) as u16
+        };
+        let rect_tile = |r: [f32; 4]| tile_of([[r[0], r[1]]; 4]);
+        let mut lod_faces: HashMap<String, LodFace> = HashMap::new();
+        for s in &states {
+            if lod_faces.contains_key(&*s.block) {
+                continue;
+            }
+            let face = if s.fluid == Some(Fluid::Water) && s.quads.iter().all(|q| q.tinted) || &*s.block == "water" {
+                // Darker than the water tint: from afar the opaque surface stands in for deep, see-through water.
+                let t = rect_tile(water_uv);
+                let deep = WATER.map(|c| (c as u32 * 55 / 100) as u8);
+                LodFace { top: t, side: t, top_tint: deep, side_tint: deep }
+            } else if &*s.block == "lava" {
+                let t = rect_tile(lava_uv);
+                LodFace { top: t, side: t, top_tint: [255; 3], side_tint: [255; 3] }
+            } else {
+                let Some(top) = s.quads.iter().find(|q| q.cull == Some(Dir::Up)).or_else(|| s.quads.first()) else { continue };
+                let side = s.quads.iter().find(|q| matches!(q.cull, Some(Dir::North | Dir::South | Dir::East | Dir::West))).unwrap_or(top);
+                let tint = |q: &Quad| if q.tinted { s.tint } else { [255; 3] };
+                LodFace { top: tile_of(top.uv), side: tile_of(side.uv), top_tint: tint(top), side_tint: tint(side) }
+            };
+            lod_faces.insert(s.block.to_string(), face);
+        }
+        Ok(Self { white_uv, lod_faces, states, atlas, water_uv, lava_uv, water_flow_uv, lava_flow_uv, crack_uv, explosion_uv, smoke_uv, particle_types, particle_sprites, items, components, gui, sound_types: sound_types(), sound_events, entities, lang, menus })
     }
 }
 
@@ -698,4 +776,13 @@ mod audit {
         println!("{} items with missing textures:\n{}", problems.len(), problems.join("\n"));
         assert!(problems.is_empty() && m.atlas.missing.is_empty());
     }
+}
+
+/// A block as distant terrain draws it: the atlas tiles (`y * columns + x`) of its top and side textures, and tints.
+#[derive(Clone, Copy, Debug)]
+pub struct LodFace {
+    pub top: u16,
+    pub side: u16,
+    pub top_tint: [u8; 3],
+    pub side_tint: [u8; 3],
 }

@@ -5,7 +5,7 @@ mod gui;
 mod mesh;
 
 pub use gui::{Gui, GuiTexture, GuiVertex};
-pub use mesh::{Area, ChunkMesh, ChunkVertex, Vertex, brightness, lightmap, mesh_chunk};
+pub use mesh::{Area, ChunkMesh, ChunkVertex, Geometry, Vertex, brightness, lightmap, mesh_chunk};
 
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
@@ -180,6 +180,15 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     depth: wgpu::TextureView,
     opaque: wgpu::RenderPipeline,
+    lod: wgpu::RenderPipeline,
+    lod_uniforms: wgpu::Buffer,
+    lod_bind_group: wgpu::BindGroup,
+    /// Distant terrain by region (x, z): its mesh and Y range.
+    lod_meshes: HashMap<(i32, i32), (GpuMesh, f32, f32)>,
+    /// This frame's distant-terrain projection and the distance inside which it hides (real chunks are there).
+    pub lod_view: Option<(Mat4, f32)>,
+    /// The block atlas size in 16-pixel tiles (distant terrain picks textures by tile).
+    atlas_tiles: (f32, f32),
     translucent: wgpu::RenderPipeline,
     overlay_pipeline: wgpu::RenderPipeline,
     cutout: wgpu::RenderPipeline,
@@ -369,6 +378,22 @@ impl Renderer {
         let bind_group = group("blocks", &block_view, &sampler);
         let gui_bind_group = group("gui", &gui_view, &sampler);
         let panorama_bind_group = group("panorama", &panorama_view, &smooth);
+        // Distant terrain draws with its own projection (far plane out at the LOD distance), so its own uniforms.
+        let lod_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("lod uniforms"),
+            size: std::mem::size_of::<Uniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let lod_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lod"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: lod_uniforms.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&block_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
+        });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("blocks"),
@@ -441,6 +466,7 @@ impl Renderer {
         let v = || Some(vertex_layout.clone());
         let c = || Some(chunk_layout.clone());
         let opaque = make(P { label: "opaque", vs: "vs_chunk", fs: "fs_opaque", buffers: c(), topology: tri, blend: None, depth_write: true, compare: less, cull: Some(wgpu::Face::Back) });
+        let lod = make(P { label: "lod", vs: "vs_lod", fs: "fs_lod", buffers: c(), topology: tri, blend: None, depth_write: true, compare: less, cull: Some(wgpu::Face::Back) });
         let translucent = make(P { label: "translucent", vs: "vs_chunk", fs: "fs_translucent", buffers: c(), topology: tri, blend: alpha, depth_write: false, compare: less, cull: Some(wgpu::Face::Back) });
         let overlay_pipeline = make(P { label: "overlay", vs: "vs", fs: "fs_translucent", buffers: v(), topology: tri, blend: alpha, depth_write: false, compare: less, cull: None });
         // Entities, dropped items and the hand: alpha-tested, both sides.
@@ -482,6 +508,12 @@ impl Renderer {
             config,
             depth,
             opaque,
+            lod,
+            lod_uniforms,
+            lod_bind_group,
+            lod_meshes: HashMap::new(),
+            lod_view: None,
+            atlas_tiles: ((atlas.width / 16) as f32, (atlas.height / 16) as f32),
             translucent,
             overlay_pipeline,
             cutout,
@@ -567,6 +599,28 @@ impl Renderer {
     pub fn clear_chunks(&mut self) {
         self.chunks.clear();
         self.gpu_bytes = 0;
+        self.lod_meshes.clear();
+    }
+
+    /// Sets (or with empty geometry removes) the distant-terrain mesh of region `key`, spanning Y `y`.
+    pub fn upload_lod(&mut self, key: (i32, i32), g: &Geometry, y: (f32, f32)) {
+        match upload(&self.device, g) {
+            Some(m) => self.lod_meshes.insert(key, (m, y.0, y.1)),
+            None => self.lod_meshes.remove(&key),
+        };
+    }
+
+    pub fn clear_lod(&mut self) {
+        self.lod_meshes.clear();
+    }
+
+    pub fn remove_lod(&mut self, key: (i32, i32)) {
+        self.lod_meshes.remove(&key);
+    }
+
+    /// Regions of distant terrain loaded, and their GPU bytes.
+    pub fn lod_stats(&self) -> (usize, u64) {
+        (self.lod_meshes.len(), self.lod_meshes.values().map(|m| m.0.bytes()).sum())
     }
 
     /// Draws one frame. Without `world` only the GUI is drawn (menus outside a world).
@@ -656,6 +710,53 @@ impl Renderer {
         let clear = if world { env.fog } else { [0.0; 3] };
         // The surface is sRGB: clear with the linear value of the fog color.
         let lin = |c: f32| (c as f64).powf(2.2);
+        let clear_color = wgpu::LoadOp::Clear(wgpu::Color { r: lin(clear[0]), g: lin(clear[1]), b: lin(clear[2]), a: 1.0 });
+        // Distant terrain first, with its own far-reaching projection; the world then draws over it on fresh depth.
+        let lod = self.lod_view.filter(|_| world && !self.lod_meshes.is_empty());
+        if let Some((lod_vp, inner)) = lod {
+            let mut lu = u;
+            lu.view_proj = lod_vp.to_cols_array_2d();
+            lu.inv_view_proj = lod_vp.inverse().to_cols_array_2d();
+            lu.screen[2] = inner;
+            lu.ambient[3] = self.atlas_tiles.0;
+            lu.block_tint[3] = self.atlas_tiles.1;
+            self.queue.write_buffer(&self.lod_uniforms, 0, bytemuck::bytes_of(&lu));
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("lod"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: clear_color, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
+                    stencil_ops: None,
+                }),
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+            pass.set_bind_group(0, &self.gui_bind_group, &[]);
+            pass.set_pipeline(&self.sky_pipeline);
+            pass.draw(0..3, 0..1);
+            if celestial_count > 0 {
+                pass.set_pipeline(&self.celestial_pipeline);
+                pass.set_vertex_buffer(0, self.celestial_buffer.buffer.slice(..));
+                pass.draw(0..celestial_count, 0..1);
+            }
+            pass.set_bind_group(0, &self.lod_bind_group, &[]);
+            pass.set_pipeline(&self.lod);
+            for (&(x, z), (m, y0, y1)) in &self.lod_meshes {
+                let min = Vec3::new(x as f32 * 512.0, *y0, z as f32 * 512.0);
+                if visible(&lod_vp, min, Vec3::new(min.x + 512.0, *y1, min.z + 512.0)) {
+                    pass.set_vertex_buffer(0, m.vertices.slice(..));
+                    pass.set_index_buffer(m.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..m.count, 0, 0..1);
+                }
+            }
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("world"),
@@ -663,10 +764,7 @@ impl Renderer {
                     view: &view,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: lin(clear[0]), g: lin(clear[1]), b: lin(clear[2]), a: 1.0 }),
-                        store: wgpu::StoreOp::Store,
-                    },
+                    ops: wgpu::Operations { load: if lod.is_some() { wgpu::LoadOp::Load } else { clear_color }, store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth,
@@ -677,7 +775,7 @@ impl Renderer {
                 timestamp_writes: None,
                 multiview_mask: None,
             });
-            if world {
+            if world && lod.is_none() {
                 pass.set_bind_group(0, &self.gui_bind_group, &[]);
                 pass.set_pipeline(&self.sky_pipeline);
                 pass.draw(0..3, 0..1);
@@ -686,6 +784,8 @@ impl Renderer {
                     pass.set_vertex_buffer(0, self.celestial_buffer.buffer.slice(..));
                     pass.draw(0..celestial_count, 0..1);
                 }
+            }
+            if world {
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_pipeline(&self.opaque);
                 for (c, _) in &visible_chunks {

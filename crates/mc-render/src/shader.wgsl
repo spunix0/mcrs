@@ -76,9 +76,51 @@ fn fogged(rgb: vec3<f32>, dist: f32) -> vec3<f32> {
 @fragment
 fn fs_opaque(i: VOut) -> @location(0) vec4<f32> {
     let t = textureSample(atlas, atlas_sampler, i.uv) * i.color;
-    if t.a < 0.5 {
+    // Vertex alpha 254 marks solid (fast) leaves: their see-through pixels stay.
+    if t.a < 0.5 && i.color.a > 0.999 {
         discard;
     }
+    return vec4<f32>(fogged(t.rgb, i.dist), 1.0);
+}
+
+struct LodOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) local: vec2<f32>,
+    @location(1) color: vec4<f32>,
+    @location(2) dist: f32,
+    @location(3) @interpolate(flat) tile: u32,
+    @location(4) rel: vec2<f32>,
+};
+
+// Distant terrain: `uv` is in blocks along the face, the atlas tile rides in the light's spare bytes.
+@vertex
+fn vs_lod(@location(0) pos: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) color: vec4<f32>, @location(3) light: vec4<f32>) -> LodOut {
+    var o: LodOut;
+    o.clip = u.view_proj * vec4<f32>(pos, 1.0);
+    o.local = uv;
+    let l = lightmap(light.x * 15.0, light.y * 15.0);
+    o.color = vec4<f32>(pow(color.rgb * l, vec3<f32>(2.2)), 1.0);
+    o.dist = length(pos - u.camera.xyz);
+    o.tile = u32(round(light.z * 255.0)) + u32(round(light.w * 255.0)) * 256u;
+    o.rel = pos.xz - u.camera.xz;
+    return o;
+}
+
+// Each block's texture repeated across the cell (ambient.w and block_tint.w hold the atlas size in tiles), sampled
+// with the gradient of the unwrapped coordinates so mipmaps stay smooth; hidden inside the square of loaded chunks
+// (screen.z blocks out each way), where real terrain draws.
+@fragment
+fn fs_lod(i: LodOut) -> @location(0) vec4<f32> {
+    if max(abs(i.rel.x), abs(i.rel.y)) < u.screen.z {
+        discard;
+    }
+    let cols = u32(u.ambient.w);
+    let size = vec2<f32>(1.0 / u.ambient.w, 1.0 / u.block_tint.w);
+    let origin = vec2<f32>(f32(i.tile % cols), f32(i.tile / cols)) * size;
+    let inset = size * (0.5 / 16.0);
+    let uv = origin + inset + fract(i.local) * (size - 2.0 * inset);
+    let g = i.local * size;
+    let t = textureSampleGrad(atlas, atlas_sampler, uv, dpdx(g), dpdy(g)) * i.color;
     return vec4<f32>(fogged(t.rgb, i.dist), 1.0);
 }
 

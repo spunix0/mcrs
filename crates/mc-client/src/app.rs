@@ -95,6 +95,11 @@ pub struct App {
     screens: Vec<Screen>,
     focus: Focus,
     game: Option<Game>,
+    /// Distant terrain for the open world, and that world's folder (singleplayer).
+    lod: Option<crate::lod::Lod>,
+    lod_world: Option<std::path::PathBuf>,
+    /// The server we're on (multiplayer), which names its distant-terrain cache.
+    lod_server: Option<String>,
     pending: Option<Pending>,
     server: Option<LocalServer>,
     saving: Vec<std::thread::JoinHandle<()>>,
@@ -140,6 +145,9 @@ impl App {
             servers,
             window: None,
             renderer: None,
+            lod: None,
+            lod_world: None,
+            lod_server: None,
             gilrs: Gilrs::new()
                 .map_err(|e| eprintln!("gamepad support unavailable: {e}"))
                 .ok()
@@ -211,11 +219,13 @@ impl App {
 
     /// Opens a connection in the background; the game starts when it succeeds.
     fn connect(&mut self, target: String) {
+        self.lod_server = Some(target.clone());
         let (result_tx, result) = channel();
         let (event_tx, events) = channel();
         let ended = Arc::new(Mutex::new(None));
         let (name, view_distance) = (self.name.clone(), self.options.render_distance);
         let components = mc_inventory_components(&self.models);
+        let particle_types = self.models.particle_types.clone();
         let block_states = self.models.states.len();
         let addr = target.clone();
         let ended_t = ended.clone();
@@ -237,6 +247,7 @@ impl App {
                 drives_movement: true,
                 view_distance,
                 components: Some(&components),
+                particle_types: &particle_types,
             };
             let reason = match session::run(&opts, tx, rx, |e| {
                 let _ = event_tx.send(e);
@@ -256,6 +267,7 @@ impl App {
             Ok(s) => {
                 self.server = Some(s);
                 self.singleplayer = true;
+                self.lod_world = Some(self.setup.worlds.join(&folder).join("world"));
                 self.screens.push(Screen::Loading { title: "Loading world".into() });
             }
             Err(e) => {
@@ -270,6 +282,8 @@ impl App {
 
     /// Leaves the world or server and goes back to the title screen (saving a singleplayer world first).
     fn disconnect(&mut self, message: Option<(String, String)>) {
+        self.lod_world = None;
+        self.lod_server = None;
         if let Some(g) = self.game.take() {
             g.tx.shutdown();
         }
@@ -500,6 +514,13 @@ impl App {
         }
         self.poll_world();
         if let (Some(g), Some(r)) = (&mut self.game, &mut self.renderer) {
+            g.graphics(self.options.cutout_leaves, self.options.particles);
+            // On servers, distant terrain comes from what we've been sent: data/lod-cache/<server>/<dimension>.
+            let cache = (self.lod_world.is_none() && self.options.lod_distance > 0).then(|| self.lod_server.as_ref()).flatten().map(|s| {
+                let safe: String = s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
+                self.setup.worlds.parent().unwrap_or(&self.setup.worlds).join("lod-cache").join(safe).join(g.sky.dimension.folder())
+            });
+            g.set_lod_cache(cache);
             g.drain(Some(r));
             r.animate(&self.models.atlas, (self.started.elapsed().as_millis() / 50) as u64);
         }
@@ -724,7 +745,44 @@ impl App {
 
         if let Some(r) = &mut self.renderer {
             (r.cave_culling, r.entity_culling) = (self.options.cave_culling, self.options.entity_culling);
-            let fog_end = self.options.render_distance as f32 * 16.0;
+            let mut fog_end = self.options.render_distance as f32 * 16.0;
+            // Distant terrain from the open world's region files (MCRS_LOD_WORLD points elsewhere, for testing).
+            let o = &self.options;
+            let world_dir = std::env::var_os("MCRS_LOD_WORLD").map(std::path::PathBuf::from).or_else(|| self.lod_world.clone());
+            r.lod_view = None;
+            let game = self.game.as_ref().filter(|_| in_world && o.lod_distance > 0);
+            // A singleplayer world's region files, or else this server's cache of received chunks.
+            let source = game.and_then(|g| match &world_dir {
+                Some(world) => Some(world.join("dimensions").join("minecraft").join(g.sky.dimension.folder()).join("region")),
+                None => g.lod_cache_dir(),
+            });
+            match (game, source) {
+                (Some(g), Some(dir)) => {
+                    if self.lod.as_ref().is_none_or(|l| l.dir() != dir) {
+                        r.clear_lod();
+                        self.lod = Some(crate::lod::Lod::new(dir, Arc::new(self.models.lod_faces.clone())));
+                    }
+                    let lod = self.lod.as_mut().unwrap();
+                    let center = ((g.cam.eye[0] / 16.0).floor() as i32, (g.cam.eye[2] / 16.0).floor() as i32);
+                    for key in lod.update(center, o.lod_distance as i32, o.lod_quality) {
+                        r.remove_lod(key);
+                    }
+                    for b in lod.poll() {
+                        r.upload_lod(b.key, &b.geometry, b.y);
+                    }
+                    // Its own projection reaches out to the LOD distance; it hides where real chunks are.
+                    let far = o.lod_distance as f32 * 16.0 * 1.5 + 400.0;
+                    let near = (o.render_distance as f32 * 8.0).max(16.0);
+                    let (lod_vp, _, _) = g.camera_with(r.aspect(), o, near, far);
+                    r.lod_view = Some((lod_vp, (o.render_distance as f32 - 0.5) * 16.0));
+                    fog_end = o.lod_distance as f32 * 16.0;
+                }
+                _ => {
+                    if self.lod.take().is_some() {
+                        r.clear_lod();
+                    }
+                }
+            }
             let stats = r.render(view_proj, eye, fog_end, &env, &overlay, &gui, in_world);
             if let Some(g) = &mut self.game {
                 g.stats = (stats.drawn, stats.loaded, stats.triangles, stats.gpu_bytes);

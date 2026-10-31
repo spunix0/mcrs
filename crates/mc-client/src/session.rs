@@ -86,6 +86,8 @@ pub enum Event {
     EntityRemove(Vec<i32>),
     /// An item or XP orb was picked up (vanilla plays the pickup sound from this).
     TakeItem(i32),
+    /// `level_particles`: type, data, position, spread, speed, count, randomization mode, always shown.
+    Particles { kind: u32, data: crate::particles::Data, pos: [f64; 3], dist: [f32; 3], speed: [f32; 3], count: i32, mode: i32, always: bool },
     EntityMotion(i32, [f64; 3]),
     /// An explosion: center, radius, the push it gives us, and its sound (None = the default).
     Explode { center: [f64; 3], radius: f32, knockback: Option<[f64; 3]>, sound: Option<SoundRef> },
@@ -202,6 +204,70 @@ fn vec3(r: &mut Reader) -> Result<[f64; 3]> {
     Ok([r.f64()?, r.f64()?, r.f64()?])
 }
 
+
+/// `ParticleTypes.STREAM_CODEC`: the type ID, then whatever data that type carries.
+fn particle_options(r: &mut Reader, names: &[String], comps: Option<&Components>) -> Result<(u32, crate::particles::Data)> {
+    use crate::particles::Data;
+    let id = r.varint()? as u32;
+    let rgb = |c: i32| [((c >> 16) & 255) as f32 / 255.0, ((c >> 8) & 255) as f32 / 255.0, (c & 255) as f32 / 255.0];
+    let data = match names.get(id as usize).map_or("", String::as_str) {
+        "block" | "block_marker" | "falling_dust" | "dust_pillar" | "block_crumble" => Data::Block(r.varint()? as u16),
+        "dust" | "effect" | "instant_effect" => {
+            let c = r.i32()?;
+            Data::Color(rgb(c), r.f32()?)
+        }
+        "dust_color_transition" => {
+            let (a, b) = (r.i32()?, r.i32()?);
+            Data::Transition(rgb(a), rgb(b), r.f32()?)
+        }
+        "entity_effect" | "tinted_leaves" | "flash" => Data::Color(rgb(r.i32()?), 1.0),
+        "dragon_breath" | "sculk_charge" => {
+            r.f32()?;
+            Data::None
+        }
+        "geyser" | "geyser_plume" => {
+            r.i32()?;
+            Data::None
+        }
+        "geyser_base" | "geyser_poof" => {
+            r.i32()?;
+            r.f32()?;
+            Data::None
+        }
+        "shriek" => {
+            r.varint()?;
+            Data::None
+        }
+        "item" => {
+            let Some(comps) = comps else { bail!("item particle without components") };
+            let mut ok = true;
+            let item = stack(r, comps, &mut ok).map_or(0, |s| s.item);
+            if !ok {
+                bail!("unreadable item particle");
+            }
+            Data::Item(item)
+        }
+        "vibration" => {
+            // PositionSource: a block position, or an entity and a height on it; then the arrival time.
+            if r.varint()? == 0 {
+                r.i64()?;
+            } else {
+                r.varint()?;
+                r.f32()?;
+            }
+            r.varint()?;
+            Data::None
+        }
+        "trail" => {
+            vec3(r)?;
+            let c = r.i32()?;
+            r.varint()?;
+            Data::Color(rgb(c), 1.0)
+        }
+        _ => Data::None,
+    };
+    Ok((id, data))
+}
 /// `SynchedEntityData` entries: index, serializer ID, value; 0xff ends the list. Only the entries we use are kept.
 /// Serializers we can't skip (particles, profiles) end the read early, which only loses later indices.
 fn entity_data(r: &mut Reader, comps: Option<&Components>) -> Result<(Vec<crate::entities::Data>, Option<i32>)> {
@@ -571,6 +637,8 @@ pub struct Options<'a> {
     pub view_distance: u8,
     /// Needed to read item stacks; without it inventory packets are ignored.
     pub components: Option<&'a Components>,
+    /// Particle type names by ID, to read the data some of them carry.
+    pub particle_types: &'a [String],
 }
 
 /// Reads one stack; an unknown component keeps the stack but means the rest of the packet can't be trusted.
@@ -834,6 +902,16 @@ pub fn run(opts: &Options, tx: Sender, mut rx: mc_protocol::Receiver, mut emit: 
                 emit(Event::EntityRemove(ids));
             }
             (State::Play, play::s2c::TAKE_ITEM_ENTITY) => emit(Event::TakeItem(r.varint()?)),
+            (State::Play, play::s2c::LEVEL_PARTICLES) => {
+                if let Ok((kind, data)) = particle_options(&mut r, opts.particle_types, opts.components) {
+                    let (_override, always) = (r.bool()?, r.bool()?);
+                    let pos = vec3(&mut r)?;
+                    let dist = [r.f32()?, r.f32()?, r.f32()?];
+                    let speed = [r.f32()?, r.f32()?, r.f32()?];
+                    let (count, mode) = (r.varint()?, r.varint()?);
+                    emit(Event::Particles { kind, data, pos, dist, speed, count, mode, always });
+                }
+            }
             (State::Play, play::s2c::EXPLODE) => {
                 let center = vec3(&mut r)?;
                 let radius = r.f32()?;

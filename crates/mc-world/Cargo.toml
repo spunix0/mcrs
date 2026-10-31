@@ -7,4 +7,5 @@ publish.workspace = true
 
 [dependencies]
 mc-nbt = { path = "../mc-nbt" }
+flate2 = "1.1.10"
 

@@ -1,5 +1,6 @@
 ﻿//! Client-side world state: chunk sections, block-state palettes, light data and block queries used by the renderer and physics.
 
+pub mod region;
 pub mod relight;
 
 use std::io::{Error, ErrorKind, Result};

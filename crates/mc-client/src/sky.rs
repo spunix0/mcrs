@@ -17,6 +17,15 @@ pub enum Dimension {
 }
 
 impl Dimension {
+    /// The folder its saves live in (`dimensions/minecraft/<this>`).
+    pub fn folder(self) -> &'static str {
+        match self {
+            Dimension::Overworld => "overworld",
+            Dimension::Nether => "the_nether",
+            Dimension::End => "the_end",
+        }
+    }
+
     pub fn from_name(name: &str) -> Self {
         match name.strip_prefix("minecraft:").unwrap_or(name) {
             "the_nether" => Self::Nether,

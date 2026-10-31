@@ -78,7 +78,7 @@ impl Game {
     }
 
     /// The texture rectangle a block's particles use (its first face) and the tint.
-    fn particle_texture(&self, state: u16) -> Option<([f32; 4], [u8; 3])> {
+    pub(super) fn particle_texture(&self, state: u16) -> Option<([f32; 4], [u8; 3])> {
         let s = self.models.states.get(state as usize)?;
         let q = s.quads.first()?;
         let (mut u0, mut v0, mut u1, mut v1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
@@ -526,6 +526,19 @@ impl Game {
         self.x_bob += (self.cam.pitch - self.x_bob) * 0.5;
         self.y_bob += (self.cam.yaw - self.y_bob) * 0.5;
         self.hurt_time = (self.hurt_time - 1.0).max(0.0);
+        // Hud.extractPlayerHealth: losing health blinks the hearts for 20 ticks; the white "lost" hearts catch up after a second.
+        let (tick, last, mut shown, mut shown_at, mut blink_until) = self.hearts;
+        let tick = tick + 1;
+        let hp = self.health.ceil() as i32;
+        if hp < last && self.hurt_time > 0.0 {
+            (shown_at, blink_until) = (Instant::now(), tick + 20);
+        } else if hp > last && self.hurt_time > 0.0 {
+            (shown_at, blink_until) = (Instant::now(), tick + 10);
+        }
+        if shown_at.elapsed() > Duration::from_secs(1) {
+            (shown, shown_at) = (hp, Instant::now());
+        }
+        self.hearts = (tick, hp, shown, shown_at, blink_until);
         // FOV: sprinting widens it (movement speed modifier), smoothed like vanilla.
         self.fov_mod_o = self.fov_mod;
         let target_fov = if self.mode == Mode::Fly { 1.1 } else if c.sprint && c.forward > 0.0 { 1.15 } else { 1.0 };
@@ -534,6 +547,10 @@ impl Game {
         let solid = |x, y, z| world.state(x, y, z).is_some_and(|s| !s.collision.is_empty());
         self.entities.tick(solid, |x, y, z| world.state(x, y, z).is_some_and(|s| s.fluid == Some(mc_assets::Fluid::Water)));
         self.particles.tick(solid);
+        self.animate_tick();
+        if let Some(cache) = &mut self.lod_cache {
+            cache.flush(false);
+        }
         self.sky.tick();
         // Water vision: grows while the eyes are underwater, fades fast after.
         let under = self.eye_fluid() == Some(mc_assets::Fluid::Water);
@@ -650,6 +667,11 @@ impl Game {
 
     /// The camera for this frame: (world view-projection, eye, hand camera space to world).
     pub fn camera(&self, aspect: f32, o: &Options) -> (Mat4, Vec3, Mat4) {
+        self.camera_with(aspect, o, 0.05, o.render_distance as f32 * 16.0 * 1.5 + 400.0)
+    }
+
+    /// [`Game::camera`] with other near and far planes (distant terrain draws with its own).
+    pub fn camera_with(&self, aspect: f32, o: &Options, near: f32, far: f32) -> (Mat4, Vec3, Mat4) {
         let a = self.tick_time / TICK;
         let eye = Vec3::new(self.cam.eye[0] as f32, self.cam.eye[1] as f32, self.cam.eye[2] as f32);
         let view = glam::camera::rh::view::look_to_mat4(eye, self.cam.look(), Vec3::Y);
@@ -674,8 +696,7 @@ impl Game {
         }
         let view = bob * view;
         let fov = o.fov * lerp(self.fov_mod_o, self.fov_mod, a);
-        let far = o.render_distance as f32 * 16.0 * 1.5 + 400.0;
-        let proj = glam::camera::rh::proj::directx::perspective(fov.to_radians(), aspect, 0.05, far);
+        let proj = glam::camera::rh::proj::directx::perspective(fov.to_radians(), aspect, near, far);
         // The hand is drawn as if with vanilla's fixed 70 degree hand FOV.
         let k = (fov.to_radians() / 2.0).tan() / 35f32.to_radians().tan();
         let hand = view.inverse() * Mat4::from_scale(Vec3::new(k, k, 1.0)) * bob;
@@ -851,7 +872,9 @@ impl Game {
                 air: self.air,
                 xp_progress: self.xp.0,
                 xp_level: self.xp.1,
-                blink: self.hurt_time > 0.0 && (self.hurt_time as i32) % 2 == 0,
+                blink: self.hearts.4 > self.hearts.0 && (self.hearts.4 - self.hearts.0) / 3 % 2 == 1,
+                old_health: self.hearts.2,
+                tick: self.hearts.0,
             };
             hud::status(p, &status);
         }
@@ -1066,4 +1089,180 @@ fn interactive(block: &str) -> bool {
         "beacon", "daylight_detector",
     ];
     ENDS.iter().any(|e| block.ends_with(e)) || NAMES.contains(&block) || matches!(block, "crafter" | "jukebox" | "composter" | "respawn_anchor")
+}
+
+impl Game {
+    /// ClientLevel.animateTick: each tick 667 random blocks within 16 and 667 within 32 get their `animateTick`:
+    /// torch flames and smoke, fire, campfires, lava pops, portal swirls, furnaces, candles, falling leaves, and the
+    /// sounds that go with them.
+    pub(super) fn animate_tick(&mut self) {
+        use crate::particles::Data;
+        let models = self.models.clone();
+        let eye = self.cam.eye.map(|v| v.floor() as i32);
+        let mut ps = std::mem::take(&mut self.particles);
+        for _ in 0..667 {
+            for radius in [16.0f32, 32.0] {
+                let mut off = [0i32; 3];
+                for o in &mut off {
+                    *o = (self.rand() * radius) as i32 - (self.rand() * radius) as i32;
+                }
+                let [x, y, z] = [eye[0] + off[0], eye[1] + off[1], eye[2] + off[2]];
+                let state = self.state_at([x, y, z]);
+                if state == 0 {
+                    continue;
+                }
+                let Some(st) = models.states.get(state as usize) else { continue };
+                let (r1, r2, r3) = (self.rand(), self.rand(), self.rand());
+                let (bx, by, bz) = (x as f32, y as f32, z as f32);
+                let at = |dx: f32, dy: f32, dz: f32| Vec3::new(bx + dx, by + dy, bz + dz);
+                let snd = |dx: f32, dy: f32, dz: f32| [x as f64 + dx as f64, y as f64 + dy as f64, z as f64 + dz as f64];
+                let none = Data::None;
+                let red = Data::Color([1.0, 0.0, 0.0], 1.0);
+                let back = Vec3::new(-st.facing[0] as f32, 0.0, -st.facing[1] as f32);
+                let block = &*st.block;
+                match block {
+                    "torch" | "soul_torch" | "copper_torch" | "wall_torch" | "soul_wall_torch" | "copper_wall_torch" => {
+                        // TorchBlock / WallTorchBlock: smoke and a flame at the tip (wall torches lean out from the wall).
+                        let wall = block.contains("wall");
+                        let p = at(0.5, 0.7, 0.5) + if wall { back * 0.27 + Vec3::Y * 0.22 } else { Vec3::ZERO };
+                        let flame = if block.starts_with("soul") {
+                            "soul_fire_flame"
+                        } else if block.starts_with("copper") {
+                            "copper_fire_flame"
+                        } else {
+                            "flame"
+                        };
+                        ps.ambient("smoke", p, Vec3::ZERO, &none);
+                        ps.ambient(flame, p, Vec3::ZERO, &none);
+                    }
+                    "redstone_torch" | "redstone_wall_torch" if st.lit => {
+                        let wall = block.contains("wall");
+                        let jitter = Vec3::new(r1 - 0.5, r2 - 0.5, r3 - 0.5) * 0.2;
+                        let p = at(0.5, 0.7, 0.5) + jitter + if wall { back * 0.27 + Vec3::Y * 0.22 } else { Vec3::ZERO };
+                        ps.ambient("dust", p, Vec3::ZERO, &red);
+                    }
+                    "redstone_ore" | "deepslate_redstone_ore" if st.lit => {
+                        // RedStoneOreBlock.spawnParticles: specks just outside a random face.
+                        let face = (r1 * 6.0) as usize % 6;
+                        let mut p = at(r2, r3, self.rand());
+                        let o = [[0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]][face];
+                        for (i, d) in o.iter().enumerate() {
+                            if *d != 0 {
+                                p[i] = [bx, by, bz][i] + 0.5 + 0.5625 * *d as f32;
+                            }
+                        }
+                        ps.ambient("dust", p, Vec3::ZERO, &red);
+                    }
+                    "fire" | "soul_fire" => {
+                        if r1 < 1.0 / 24.0 {
+                            self.sound("block.fire.ambient", Some(snd(0.5, 0.5, 0.5)), 1.0 + r2, r3 * 0.7 + 0.3, category::BLOCKS);
+                        }
+                        for _ in 0..3 {
+                            let p = at(self.rand(), self.rand() * 0.5 + 0.5, self.rand());
+                            ps.ambient("large_smoke", p, Vec3::ZERO, &none);
+                        }
+                    }
+                    "campfire" | "soul_campfire" if st.lit => {
+                        if r1 < 0.1 {
+                            self.sound("block.campfire.crackle", Some(snd(0.5, 0.5, 0.5)), 0.5 + r2, r3 * 0.7 + 0.6, category::BLOCKS);
+                        }
+                        let p = at(0.5 + (r2 - 0.5) * 0.66, 0.5 + r3 * 0.5, 0.5 + (self.rand() - 0.5) * 0.66);
+                        ps.ambient("campfire_cosy_smoke", p, Vec3::new(0.0, 0.07, 0.0), &none);
+                        if block == "campfire" && r1 < 0.2 {
+                            ps.ambient("lava", at(0.5, 0.5, 0.5), Vec3::ZERO, &none);
+                        }
+                    }
+                    "lava" => {
+                        // LavaFluid.animateTick: pops and gurgles under open air.
+                        if self.state_at([x, y + 1, z]) == 0 {
+                            if r1 < 0.01 {
+                                ps.ambient("lava", at(r2, 1.0, r3), Vec3::ZERO, &none);
+                                self.sound("block.lava.pop", Some(snd(r2, 1.0, r3)), 0.2 + r2 * 0.2, 0.9 + r3 * 0.15, category::BLOCKS);
+                            }
+                            if r1 > 0.995 {
+                                self.sound("block.lava.ambient", Some(snd(0.5, 0.5, 0.5)), 0.2 + r2 * 0.2, 0.9 + r3 * 0.15, category::BLOCKS);
+                            }
+                        }
+                    }
+                    "nether_portal" => {
+                        if r1 < 0.01 {
+                            self.sound("block.portal.ambient", Some(snd(0.5, 0.5, 0.5)), 0.5, r2 * 0.4 + 0.8, category::BLOCKS);
+                        }
+                        for _ in 0..4 {
+                            let p = at(self.rand(), self.rand(), self.rand());
+                            let v = Vec3::new(self.rand() - 0.5, self.rand() - 0.5, self.rand() - 0.5) * 0.5;
+                            ps.ambient("portal", p, v, &none);
+                        }
+                    }
+                    "ender_chest" => {
+                        for _ in 0..3 {
+                            let p = at(0.5 + (self.rand() - 0.5) * 0.5, 0.5 + self.rand(), 0.5 + (self.rand() - 0.5) * 0.5);
+                            let v = Vec3::new(self.rand() - 0.5, self.rand() - 0.5, self.rand() - 0.5);
+                            ps.ambient("portal", p, v, &none);
+                        }
+                    }
+                    "end_rod" if r1 < 0.2 => {
+                        ps.ambient("end_rod", at(0.5 + (r2 - 0.5) * 0.4, 0.5 + (r3 - 0.5) * 0.4, 0.5), Vec3::new(0.0, 0.01, 0.0), &none);
+                    }
+                    "end_portal" => ps.ambient("smoke", at(r1, 0.8, r2), Vec3::ZERO, &none),
+                    "furnace" | "smoker" | "blast_furnace" if st.lit => {
+                        // AbstractFurnaceBlock: crackles, and smoke (and a flame) at the front.
+                        if r1 < 0.1 {
+                            let s = match block {
+                                "smoker" => "block.smoker.smoke",
+                                "blast_furnace" => "block.blast_furnace.fire_crackle",
+                                _ => "block.furnace.fire_crackle",
+                            };
+                            self.sound(s, Some(snd(0.5, 0.0, 0.5)), 1.0, 1.0, category::BLOCKS);
+                        }
+                        let front = -back;
+                        let side = Vec3::new(front.z, 0.0, front.x) * (r2 * 0.6 - 0.3);
+                        let p = at(0.5, r3 * 6.0 / 16.0, 0.5) + front * 0.52 + side;
+                        if block == "smoker" {
+                            ps.ambient("smoke", at(0.5, 1.1, 0.5), Vec3::ZERO, &none);
+                        } else {
+                            ps.ambient("smoke", p, Vec3::ZERO, &none);
+                            if block == "furnace" {
+                                ps.ambient("flame", p, Vec3::ZERO, &none);
+                            }
+                        }
+                    }
+                    b if st.lit && b.ends_with("candle") => {
+                        // CandleBlock: a small flame per candle, now and then a wisp of smoke and a crackle.
+                        for i in 0..st.candles.max(1) {
+                            let p = at(0.5 + (i as f32 - 1.0) * 0.12, 0.5, 0.5 + if i % 2 == 0 { 0.06 } else { -0.06 });
+                            if self.rand() < 0.3 {
+                                ps.ambient("smoke", p, Vec3::ZERO, &none);
+                            }
+                            ps.ambient("small_flame", p, Vec3::ZERO, &none);
+                        }
+                        if r1 < 0.04 {
+                            self.sound("block.candle.ambient", Some(snd(0.5, 0.5, 0.5)), 1.0 + r2, r3 * 0.7 + 0.3, category::BLOCKS);
+                        }
+                    }
+                    "brewing_stand" => ps.ambient("smoke", at(0.4 + r1 * 0.2, 0.7 + r2 * 0.3, 0.4 + r3 * 0.2), Vec3::ZERO, &none),
+                    "crying_obsidian" if r1 < 0.2 && self.state_at([x, y - 1, z]) == 0 => {
+                        ps.ambient("dripping_obsidian_tear", at(r2, -0.05, r3), Vec3::ZERO, &none);
+                    }
+                    "mycelium" if r1 < 0.1 => ps.ambient("mycelium", at(r2, 1.1, r3), Vec3::ZERO, &none),
+                    "spore_blossom" => {
+                        ps.ambient("falling_spore_blossom", at(0.5 + (r1 - 0.5) * 0.6, 0.7, 0.5 + (r2 - 0.5) * 0.6), Vec3::ZERO, &none);
+                        let p = at((r3 - 0.5) * 20.0, -self.rand() * 10.0, (self.rand() - 0.5) * 20.0);
+                        ps.ambient("spore_blossom_air", p, Vec3::ZERO, &none);
+                    }
+                    _ if st.leaves && r1 < 0.01 && self.state_at([x, y - 1, z]) == 0 => {
+                        // Leaves let a leaf fall now and then (cherry petals, pale oak leaves, or tinted ones).
+                        let (kind, data) = match block {
+                            "cherry_leaves" => ("cherry_leaves", Data::None),
+                            "pale_oak_leaves" => ("pale_oak_leaves", Data::None),
+                            _ => ("tinted_leaves", Data::Color(st.tint.map(|c| c as f32 / 255.0), 1.0)),
+                        };
+                        ps.ambient(kind, at(r2, -0.05, r3), Vec3::ZERO, &data);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.particles = ps;
+    }
 }

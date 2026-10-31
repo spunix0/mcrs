@@ -16,6 +16,7 @@ mod game;
 mod hand;
 mod hud;
 mod inventory;
+mod lod;
 mod models;
 mod options;
 mod particles;
@@ -129,7 +130,7 @@ fn headless(args: &[String], addr: &str, name: &str, greet: bool) -> Result<()> 
         });
     }
 
-    let opts = Options { addr, name, greet, block_states: None, drives_movement: false, view_distance: 2, components: None };
+    let opts = Options { addr, name, greet, block_states: None, drives_movement: false, view_distance: 2, components: None, particle_types: &[] };
     let reason = session::run(&opts, tx, rx, |e| match e {
         Event::LoggedIn(n) => println!("logged in as {n}"),
         Event::InWorld => {

@@ -80,6 +80,8 @@ pub struct Area {
     pub around: [Option<Arc<Chunk>>; 9],
     /// Sections to mesh, bit i = section i from the bottom.
     pub mask: u64,
+    /// Cutout Leaves off: leaves are solid, hide the faces between them, and keep their transparent pixels.
+    pub solid_leaves: bool,
 }
 
 impl Area {
@@ -157,7 +159,12 @@ pub fn mesh_chunk(area: &Area, models: &BlockModels) -> ChunkMesh {
     let chunk = &*area.center;
     let (ox, oz) = (chunk.x as f32 * 16.0, chunk.z as f32 * 16.0);
     let mut out = ChunkMesh { x: chunk.x, z: chunk.z, min_section: chunk.min_section, height: chunk.sections.len(), sections: Vec::new() };
-    let opaque = |x: i32, y: i32, z: i32| area.block(x, y, z).is_some_and(|s| models.states[s as usize].opaque);
+    let opaque = |x: i32, y: i32, z: i32| {
+        area.block(x, y, z).is_some_and(|s| {
+            let m = &models.states[s as usize];
+            m.opaque || (area.solid_leaves && m.leaves)
+        })
+    };
 
     for (si, section) in chunk.sections.iter().enumerate() {
         if si >= 64 || area.mask & (1 << si) == 0 {
@@ -194,13 +201,19 @@ pub fn mesh_chunk(area: &Area, models: &BlockModels) -> ChunkMesh {
                             }
                         }
                         let tint = if q.tinted { model.tint } else { [255, 255, 255] };
-                        let colors = match q.cull {
+                        let mut colors = match q.cull {
                             Some(dir) => smooth(area, &opaque, q, dir, [x, y, z], tint),
                             None => {
                                 let (sky, block) = area.light(x, y, z);
                                 [lit(tint, q.shade, sky as f32, block as f32, 1.0, 255); 4]
                             }
                         };
+                        if area.solid_leaves && model.leaves {
+                            // Alpha 254 tells the shader to keep the texture's transparent pixels (fast leaves).
+                            for c in &mut colors {
+                                c.0[3] = 254;
+                            }
+                        }
                         let pos = q.pos.map(|p| [p[0] + wx, p[1] + wy, p[2] + wz]);
                         let target = if q.translucent { &mut mesh.translucent } else { &mut mesh.opaque };
                         target.quad(pos, q.uv, colors);

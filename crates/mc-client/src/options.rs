@@ -129,6 +129,16 @@ pub struct Options {
     pub entity_culling: bool,
     pub pause_on_lost_focus: bool,
     pub fps_graph: bool,
+    /// Graphics: Fast (false) or Fancy; Fast turns Cutout Leaves off.
+    pub fancy: bool,
+    /// Leaves you can see through; off draws them solid and hides the faces between them (much faster in forests).
+    pub cutout_leaves: bool,
+    /// Particles: 0 All, 1 Decreased, 2 Minimal.
+    pub particles: u8,
+    /// Distant terrain (LOD) out to this many chunks; 0 = off.
+    pub lod_distance: u16,
+    /// LOD Bias, how detailed distant terrain is: 0 Lowest .. 4 Highest.
+    pub lod_quality: u8,
     pub keys: Vec<KeyCode>,
     pub last_server: String,
     #[allow(dead_code)]
@@ -160,6 +170,11 @@ impl Options {
             entity_culling: true,
             pause_on_lost_focus: true,
             fps_graph: true,
+            fancy: true,
+            cutout_leaves: true,
+            particles: 0,
+            lod_distance: 0,
+            lod_quality: 2,
             keys: Action::ALL.iter().map(|a| a.info().2).collect(),
             last_server: String::new(),
             path,
@@ -197,6 +212,11 @@ impl Options {
                 "mcrs.entityCulling" => o.entity_culling = b,
                 "pauseOnLostFocus" => o.pause_on_lost_focus = b,
                 "mcrs.fpsGraph" => o.fps_graph = b,
+                "graphicsMode" => o.fancy = v != "0",
+                "cutoutLeaves" => o.cutout_leaves = b,
+                "particles" => o.particles = v.parse().unwrap_or(0u8).min(2),
+                "mcrs.lodDistance" => o.lod_distance = v.parse().unwrap_or(0u16).min(1024),
+                "mcrs.lodBias" => o.lod_quality = v.parse().unwrap_or(2u8).min(4),
                 _ => {
                     if let Some(cat) = k.strip_prefix("soundCategory_") {
                         if let Some(i) = category::NAMES.iter().position(|n| *n == cat) {
@@ -243,6 +263,11 @@ impl Options {
         put("mcrs.entityCulling", self.entity_culling.to_string());
         put("pauseOnLostFocus", self.pause_on_lost_focus.to_string());
         put("mcrs.fpsGraph", self.fps_graph.to_string());
+        put("graphicsMode", (self.fancy as u8).to_string());
+        put("cutoutLeaves", self.cutout_leaves.to_string());
+        put("particles", self.particles.to_string());
+        put("mcrs.lodDistance", self.lod_distance.to_string());
+        put("mcrs.lodBias", self.lod_quality.to_string());
         for (i, v) in self.volumes.iter().enumerate() {
             put(&format!("soundCategory_{}", category::NAMES[i]), v.to_string());
         }

@@ -618,7 +618,9 @@ pub fn run(screen: &mut Screen, ui: &mut Ui, ctx: &mut Ctx) -> Action {
             let o = &mut *ctx.options;
             let mut changed = false;
             let col = |i: usize| if i % 2 == 0 { cx - 155.0 } else { cx + 5.0 };
-            let row = |i: usize| 32.0 + (i / 2) as f32 * 24.0;
+            // 9 rows of two; on short windows the rows close up (down to touching) so Done stays clear.
+            let step = ((h - 63.0) / 9.0).clamp(20.0, 24.0);
+            let row = move |i: usize| 32.0 + (i / 2) as f32 * step;
             let mut i = 0;
             let mut rd = (o.render_distance as f32 - 2.0) / 30.0;
             if ui.slider(&mut rd, &format!("Render Distance: {} chunks", o.render_distance), col(i), row(i), 150.0, Some(30)) {
@@ -664,6 +666,36 @@ pub fn run(screen: &mut Screen, ui: &mut Ui, ctx: &mut Ctx) -> Action {
             changed |= ui.toggle("Entity Culling", &mut o.entity_culling, col(i), row(i), 150.0);
             i += 1;
             changed |= ui.toggle("FPS Graph", &mut o.fps_graph, col(i), row(i), 150.0);
+            i += 1;
+            let mut g = o.fancy as usize;
+            if ui.cycle("Graphics", &["Fast", "Fancy"], &mut g, col(i), row(i), 150.0, true) {
+                // The preset sets the options under it, as vanilla's graphics presets do.
+                o.fancy = g == 1;
+                o.cutout_leaves = o.fancy;
+                changed = true;
+            }
+            i += 1;
+            changed |= ui.toggle("Cutout Leaves", &mut o.cutout_leaves, col(i), row(i), 150.0);
+            i += 1;
+            let mut pa = o.particles as usize;
+            if ui.cycle("Particles", &["All", "Decreased", "Minimal"], &mut pa, col(i), row(i), 150.0, true) {
+                o.particles = pa as u8;
+                changed = true;
+            }
+            i += 1;
+            // Distant terrain: off, or 32..1024 chunks in steps of 32.
+            let mut lod = o.lod_distance as f32 / 1024.0;
+            let label = if o.lod_distance == 0 { "LOD Distance: OFF".to_string() } else { format!("LOD Distance: {} chunks", o.lod_distance) };
+            if ui.slider(&mut lod, &label, col(i), row(i), 150.0, Some(32)) {
+                o.lod_distance = (lod * 32.0).round() as u16 * 32;
+                changed = true;
+            }
+            i += 1;
+            let mut q = o.lod_quality as usize;
+            if ui.cycle("LOD Bias", &["Lowest", "Low", "Medium", "High", "Highest"], &mut q, col(i), row(i), 150.0, o.lod_distance > 0) {
+                o.lod_quality = q as u8;
+                changed = true;
+            }
             if ui.button("Done", cx - 100.0, h - 27.0, 200.0, 20.0, true) || back {
                 return Action::Pop;
             }
